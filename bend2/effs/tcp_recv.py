@@ -18,7 +18,7 @@ def tcp_recv_with(socket_v, max_n, k, read, at=None):
             if io_late(at):
                 return io_tup(socket_v, {"$": CID(Wait), "rest": {"$": CID(Unit)}})
             io_park_on(fd, False, k, go, at)
-            return None
+            return PARKED
         got = {"$": CID(None)} if len(b) == 0 \
             else {"$": CID(Some), "value": read(b, len(b))}
         return io_tup(socket_v, io_ready(at, io_done(got)))

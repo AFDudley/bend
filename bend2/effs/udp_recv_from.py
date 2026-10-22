@@ -21,11 +21,11 @@ def udp_recv_from_with(socket_v, max_n, k, read, at=None):
             if io_late(at):
                 return io_tup(socket_v, {"$": CID(Wait), "rest": {"$": CID(Unit)}})
             io_park_on(fd, False, k, go, at)
-            return None
+            return PARKED
         dgram = io_tup(host, port, read(b, len(b)))
         return io_tup(socket_v, io_ready(at, io_done(dgram)))
     io_park_on(fd, False, k, go, at)
-    return None
+    return PARKED
 
 def udp_recv_from(socket_v, max_n, k):
     return udp_recv_from_with(socket_v, max_n, k, io_text)

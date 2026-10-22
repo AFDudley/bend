@@ -4392,6 +4392,13 @@ def sock_addr_ok(host, port):
 EAGAIN = errno.EAGAIN
 EINPROGRESS = errno.EINPROGRESS
 
+# A registered effect, or a more() woken by a wait, returns PARKED to mean
+# "no answer this call." Plain None cannot carry that meaning: Bend's own
+# null value (an erased proof or type) compiles to Python's None too, so
+# an effect that answers synchronously with null needs a way to say so
+# that a park can never be mistaken for.
+PARKED = object()
+
 _io_active = None
 
 def io_push(fun, arg, fresh, io):
@@ -4447,7 +4454,7 @@ def io_wait(io, block):
     io["waits"] = keep
     for w in due:
         x = w["more"]()
-        if x is not None:
+        if x is not PARKED:
             io_push(w["k"], x, False, io)
 
 def io_run(m):
@@ -4493,7 +4500,7 @@ def io_run(m):
                 if run is None:
                     raise Exception("bend: no effect registers " + op["$"])
                 x = run(*op["args"], op["kont"])
-                if x is None:
+                if x is PARKED:
                     break
                 left -= 1
                 if left == 1:

@@ -18,7 +18,7 @@ def tcp_send_with(socket_v, b, k, at=None):
                     rest = io_list(b[off:], len(b) - off)
                     return io_tup(socket_v, {"$": CID(Wait), "rest": rest})
                 io_park_on(fd, True, k, lambda: go(off), at)
-                return None
+                return PARKED
             off += n
         return io_tup(socket_v, io_ready(at, io_done({"$": CID(Unit)})))
     return go(0)

@@ -59,15 +59,15 @@ def chan_park(row, k, item, ms=None):
         def late():
             at = next((j for j, t in enumerate(row["wait"]) if t is w), -1)
             if at < 0:
-                return None
+                return PARKED
             row["wait"].pop(at)
             return chan_wait(item)
         w["late"] = late
         io_park_on(None, False, k, late, io_until(ms))
     row["wait"].append(w)
-    return None
+    return PARKED
 
-# Sends without waiting: Done{}, Fail{v} if closed, None if it would park.
+# Sends without waiting: Done{}, Fail{v} if closed, PARKED if it would park.
 def chan_put(row, value):
     if row["shut"]:
         return {"$": CID(Fail), "error": value}
@@ -78,9 +78,9 @@ def chan_put(row, value):
     if len(row["ring"]) < row["room"]:
         row["ring"].append(value)
         return chan_done()
-    return None
+    return PARKED
 
-# Receives without waiting: Some{v}, None{} at the end, None if not ready.
+# Receives without waiting: Some{v}, None{} at the end, PARKED if not ready.
 def chan_get(row):
     if len(row["ring"]) > 0:
         return {"$": CID(Some), "value": chan_take(row)}
@@ -89,11 +89,11 @@ def chan_get(row):
         return {"$": CID(Some), "value": chan_wake(row, chan_done())}
     if row["shut"]:
         return {"$": CID(None)}
-    return None
+    return PARKED
 
 # Ready{x} now, Wait{rest} now if ms is 0, else parks until a wake or ms.
 def chan_try(row, x, item, ms, k):
-    if x is not None:
+    if x is not PARKED:
         return {"$": CID(Ready), "value": x}
     if int(ms) == 0:
         return chan_wait(item)
@@ -104,11 +104,11 @@ def chan_new(room, k):
 
 def chan_send(row, value, k):
     x = chan_put(row, value)
-    return x if x is not None else chan_park(row, k, value)
+    return x if x is not PARKED else chan_park(row, k, value)
 
 def chan_recv(row, k):
     x = chan_get(row)
-    return x if x is not None else chan_park(row, k, CHAN_RECV)
+    return x if x is not PARKED else chan_park(row, k, CHAN_RECV)
 
 def chan_try_send(row, value, ms, k):
     return chan_try(row, chan_put(row, value), value, ms, k)

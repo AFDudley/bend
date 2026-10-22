@@ -17,10 +17,10 @@ def tcp_accept_with(listener, k, at=None):
             if io_late(at):
                 return io_tup(listener, {"$": CID(Wait), "rest": {"$": CID(Unit)}})
             io_park_on(lfd, False, k, go, at)
-            return None
+            return PARKED
         return io_tup(listener, io_ready(at, io_done(sock_reg(conn))))
     io_park_on(lfd, False, k, go, at)
-    return None
+    return PARKED
 
 def tcp_accept(listener, k):
     return tcp_accept_with(listener, k)
