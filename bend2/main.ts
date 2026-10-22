@@ -388,6 +388,8 @@ function cli_emit(book: Bend.Book, out: string): void {
     fs.writeFileSync(out, Comp.js_lib(book, true));
   } else if (/\.c?js$/.test(out)) {
     fs.writeFileSync(out, Comp.js_book(book));
+  } else if (out.endsWith(".py")) {
+    fs.writeFileSync(out, Comp.py_book(book));
   } else if (out.endsWith(".c")) {
     fs.writeFileSync(out, Comp.compile_book(book));
   } else if (out.endsWith(".bendtt")) {

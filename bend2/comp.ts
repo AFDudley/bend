@@ -74,7 +74,7 @@ type Row = [HTerm, number, number, number];
 
 type Open = { ps: Of<"Var">[]; b: HTerm };
 
-type Intr = { C?: string | string[] | null; JS?: string };
+type Intr = { C?: string | string[] | null; JS?: string; PY?: string };
 
 type Dom = [Bend.Quant, Name, HTerm];
 
@@ -801,11 +801,12 @@ function dom_live([q]: Dom): boolean {
 // Intr
 // ====
 
-function intr_of(k: Name, js = false): Intr | undefined {
+function intr_of(k: Name, soft = false): Intr | undefined {
   const tld = FL.book.tlds[k];
   const it = tld?.$ === "Def" && tld.i === undefined && tld.b
     ? OPERATIONS[op_name(k)] : undefined;
-  return it && (js || it.C !== undefined) && (!FL.js || it.JS)
+  const need = FL.py ? it?.PY : FL.js ? it?.JS : true;
+  return it && (soft || it.C !== undefined) && need
     ? it : undefined;
 }
 
@@ -1403,11 +1404,12 @@ export function io_run(book: Bend.Book, args: string[]): number {
 // passed on from a lent root (k~i<j~q). A shared value heats its type (hot).
 // compile_book emits until a pass changes no fact.
 
-function file_new(book: Bend.Book, js: boolean) {
+function file_new(book: Bend.Book, js: boolean, py = false) {
   PROBES.length = 1;
   return {
     book,
     js,
+    py,
     bangs: new Set<Name>(),
     sites: new Map<Name, number>(),
     hot: new Set<Name>(),
@@ -2152,8 +2154,8 @@ function emit_hold(sc: Scope, exprs: string[], k: string,
   ks?: Kind[]): string[] {
   return exprs.map((ex, i) => {
     const al = name_local(sc, k);
-    file_push(sc,
-      `${FL.js ? "const" : lay_c(ks?.[i] ?? "w64")} ${al} = ${ex};`);
+    const decl = FL.js ? "const " : FL.py ? "" : lay_c(ks?.[i] ?? "w64") + " ";
+    file_push(sc, `${decl}${al} = ${ex};`);
     return al;
   });
 }
@@ -2715,20 +2717,22 @@ function emit_row(sc: Scope, t: HTerm, ty: HTerm | null): string | null {
     s = term_strip(term_open(s).b);
   }
   s = emit_fold(s) ?? s;
-  const bits = k === "F32" && !FL.js;
+  const bits = k === "F32" && !FL.js && !FL.py;
   if (term_const(s)) {
-    return bits ? String(Bend.u32_from_term(s, "F32")) : js_expr(sc, s, ty);
+    return bits ? String(Bend.u32_from_term(s, "F32"))
+      : FL.py ? py_expr(sc, s, ty) : js_expr(sc, s, ty);
   }
   const m = term_spine(s);
   const it = m.t.$ === "Ref" ? intr_of(m.t.k) : undefined;
-  if (!it?.JS || TAB_BAD.test(it.JS)) {
+  const row = FL.py ? it?.PY : it?.JS;
+  if (!row || TAB_BAD.test(row)) {
     return null;
   }
   const xs = m.args.map((a) => emit_row(sc, a, null));
   if (xs.includes(null)) {
     return null;
   }
-  const r = tpl(it.JS, xs as string[]);
+  const r = tpl(row, xs as string[]);
   return bits ? `f32_bits(${r})` : r;
 }
 
@@ -2738,10 +2742,11 @@ function emit_tab(sc: Scope, cells: HTerm[] | null, ty: HTerm,
   if (!ls || ls.includes(null)) {
     return null;
   }
-  const key = (FL.js ? ls : Function("f32_bits", `return [${ls}]`)(
+  const key = (FL.js || FL.py ? ls : Function("f32_bits", `return [${ls}]`)(
     Bend.f32_to_bits).map((v: number) => BigInt(v) + "ull")).join(", ");
   const tab = "TAB_" + memo(FL.tabs, key, () => FL.tabs.size);
   return FL.js ? `${tab}[Math.min(${s}, ${ls.length - 1})]`
+    : FL.py ? `${tab}[min(${s}, ${ls.length - 1})]`
     : `TAB_AT(${tab}, ${s}, ${ls.length - 1})`;
 }
 
@@ -2841,16 +2846,22 @@ function c_ids(src: string, m = "", use?: (p: string, k: Name) => void): string 
       return t;
     }
     if (q === undefined) die(`${p}(${k}) names no constructor or def`);
-    return FL.js ? JSON.stringify(p === "CID" && q in FL.book.ctrs
+    return FL.js || FL.py ? JSON.stringify(p === "CID" && q in FL.book.ctrs
       ? js_tag(q) : q) : name_id(p + "_", q);
   });
 }
 
 function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
-  const ext = FL.js ? ".js" : ".c";
-  const miss = FL.js ? "a foreign def without a .js import: " : "no .c import: ";
-  const path = fs.realpathSync(tld.i.find((x) => x.endsWith(ext))
-    ?? die(miss + Bend.name_key(k)));
+  // The parser accepts only a .c or a .js import line (bend.ts, human-
+  // written), so a Python twin sits beside the .js file on disk instead:
+  // effs/print.js names effs/print.py.
+  const js = tld.i.find((x) => x.endsWith(".js"));
+  const found = FL.py ? js && js.replace(/\.js$/, ".py")
+    : tld.i.find((x) => x.endsWith(FL.js ? ".js" : ".c"));
+  const miss = FL.py ? "a foreign def without a .py twin: "
+    : FL.js ? "a foreign def without a .js import: " : "no .c import: ";
+  const path = fs.realpathSync(found && (!FL.py || fs.existsSync(found))
+    ? found : die(miss + Bend.name_key(k)));
   const m = tld.m ?? "";
   const seen = FL.effs.get(path);
   if (seen && seen[0] !== m) {
@@ -2858,9 +2869,9 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
   }
   if (!seen) {
     const raw = fs.readFileSync(path, "utf8");
-    const src = FL.js ? raw : raw.replace(/\\[ \t]*\r?\n/g, "");
+    const src = FL.js || FL.py ? raw : raw.replace(/\\[ \t]*\r?\n/g, "");
     FL.effs.set(path, [m, src]);
-    if (!FL.js) c_ids(src, m, (p, q) => {
+    if (!FL.js && !FL.py) c_ids(src, m, (p, q) => {
       if (p === "FID" && fun_runs(FL.book.tlds[q])) {
         src_add(q);
         FL.fids.add(q);
@@ -3310,6 +3321,982 @@ export function js_book(book: Bend.Book): string {
     name_id("$", "main")}, ${JSON.stringify(show && show.map((c) =>
       typeof c === "string" ? [js_tag(c), Bend.name_key(c)] : c))});`;
 }
+
+// Py
+// --
+
+// PY operation templates, added beside the JS ones in OPERATIONS. U32 masks
+// with & 0xFFFFFFFF, as Python ints have no fixed width. F32 rounds through
+// struct.pack (f32_rewrap, in RUNTIME_PY); a handful of math functions wrap
+// Python's domain-error exceptions back into IEEE NaN/Infinity, which Python
+// raises and JS does not.
+
+for (const [k, py] of Object.entries({
+  u32_add: "(($0 + $1) & 0xFFFFFFFF)",
+  u32_sub: "(($0 - $1) & 0xFFFFFFFF)",
+  u32_and: "($0 & $1)",
+  u32_or: "($0 | $1)",
+  u32_xor: "($0 ^ $1)",
+  u32_is_eq: "($0 == $1)",
+  u32_is_ne: "($0 != $1)",
+  u32_is_lt: "($0 < $1)",
+  u32_is_le: "($0 <= $1)",
+  u32_is_gt: "($0 > $1)",
+  u32_is_ge: "($0 >= $1)",
+  u32_mul: "(($0 * $1) & 0xFFFFFFFF)",
+  u32_div: "(0 if $1 == 0 else ($0 // $1))",
+  u32_mod: "($0 if $1 == 0 else $0 % $1)",
+  u32_inc: "(($0 + 1) & 0xFFFFFFFF)",
+  u32_shl: "(($0 << 1) & 0xFFFFFFFF)",
+  u32_shr: "($0 >> 1)",
+  u32_shln: "(0 if $1 >= 32 else ($0 << $1) & 0xFFFFFFFF)",
+  u32_shrn: "(0 if $1 >= 32 else $0 >> $1)",
+  u32_not: "((~$0) & 0xFFFFFFFF)",
+  u32_is_zero: "($0 == 0)",
+  u32_cmp: "cmp_new($0, $1)",
+  u32_to_f32: "f32_rewrap($0)",
+  u32_to_nat: "$0",
+  u32_from_nat: "($0 & 0xFFFFFFFF)",
+  f32_add: "f32_rewrap($0 + $1)",
+  f32_sub: "f32_rewrap($0 - $1)",
+  f32_mul: "f32_rewrap($0 * $1)",
+  f32_div: "f32_rewrap(f32_div($0, $1))",
+  f32_neg: "(-$0)",
+  f32_is_eq: "($0 == $1)",
+  f32_is_ne: "($0 != $1)",
+  f32_is_lt: "($0 < $1)",
+  f32_is_le: "($0 <= $1)",
+  f32_is_gt: "($0 > $1)",
+  f32_is_ge: "($0 >= $1)",
+  f32_sqrt: "f32_rewrap(f32_sqrt($0))",
+  f32_exp: "f32_rewrap(f32_exp($0))",
+  f32_log: "f32_rewrap(f32_log($0))",
+  f32_log2: "f32_rewrap(f32_log2($0))",
+  f32_log10: "f32_rewrap(f32_log10($0))",
+  f32_sin: "f32_rewrap(f32_trig(math.sin, $0))",
+  f32_cos: "f32_rewrap(f32_trig(math.cos, $0))",
+  f32_tan: "f32_rewrap(f32_trig(math.tan, $0))",
+  f32_asin: "f32_rewrap(f32_asin($0))",
+  f32_acos: "f32_rewrap(f32_acos($0))",
+  f32_atan: "f32_rewrap(math.atan($0))",
+  f32_sinh: "f32_rewrap(math.sinh($0))",
+  f32_cosh: "f32_rewrap(math.cosh($0))",
+  f32_tanh: "f32_rewrap(math.tanh($0))",
+  f32_floor: "f32_rewrap(f32_round_updown(math.floor, $0))",
+  f32_ceil: "f32_rewrap(f32_round_updown(math.ceil, $0))",
+  f32_trunc: "f32_rewrap(f32_round_updown(math.trunc, $0))",
+  f32_abs: "f32_rewrap(abs($0))",
+  f32_atan2: "f32_rewrap(math.atan2($0, $1))",
+  f32_pow: "f32_rewrap(f32_pow($0, $1))",
+  f32_mod: "f32_rewrap(f32_mod($0, $1))",
+  f32_to_u32: "(int($0) if $0 >= 1 and $0 < 4294967296 else 0)",
+  f32_bits: "f32_bits($0)",
+  f32_show: "f32_show($0)",
+  f32_read: "f32_read($0)",
+  nat_add: "nat_chk($0 + $1)",
+  nat_double: "nat_chk($0 + $0)",
+  nat_mul: "nat_chk($0 * $1)",
+  nat_cmp: "cmp_new($0, $1)",
+  nat_sub: "(0 if $0 < $1 else $0 - $1)",
+  nat_is_lt: "($0 < $1)",
+  nat_min: "($0 if $0 < $1 else $1)",
+  nat_max: "($0 if $0 > $1 else $1)",
+  nat_divmod: "nat_divmod($0, $1)",
+  bool_or: "($0 or $1)",
+  bool_xor: "($0 != $1)",
+  string_append: "($0 + $1)",
+  string_contains: "string_contains($0, $1)",
+  string_length: "len(str_out($0))",
+  array_new: "array_new($0, $1)",
+  array_set: "array_set($0, $1, $2)",
+  array_get: "{\"$\": \"Tuple\", \"fst\": $0, \"snd\": $0[$1 % len($0)]}",
+  array_swap: "array_rmw($0, $1, lambda o: $2)",
+  array_size: "{\"$\": \"Tuple\", \"fst\": $0, \"snd\": len($0)}",
+  array_clone: "{\"$\": \"Tuple\", \"fst\": $0, \"snd\": list($0)}",
+  array_atomic_add: "array_rmw($0, $1, lambda o: (o + $2) & 0xFFFFFFFF)",
+  array_atomic_min: "array_rmw($0, $1, lambda o: min(o, $2))",
+  array_atomic_max: "array_rmw($0, $1, lambda o: max(o, $2))",
+  array_atomic_and: "array_rmw($0, $1, lambda o: (o & $2) & 0xFFFFFFFF)",
+  array_atomic_or: "array_rmw($0, $1, lambda o: (o | $2) & 0xFFFFFFFF)",
+  array_atomic_xor: "array_rmw($0, $1, lambda o: (o ^ $2) & 0xFFFFFFFF)",
+  array_atomic_exch: "array_rmw($0, $1, lambda o: $2)",
+  array_atomic_cas: "array_rmw($0, $1, lambda o: ($3 if o == $2 else o))",
+  array_atomic_fadd: "array_rmw($0, $1, lambda o: f32_rewrap(o + $2))",
+})) {
+  OPERATIONS[k]!.PY = py;
+}
+
+// Per native constructor, as OPTIMIZED but for Python text: a dict with a
+// quoted "$" key, len()/slicing instead of .length/.slice, True/False/not.
+// Nat, U32, F32 and Char already read as Python, so those four are shared.
+
+const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
+  Nat: OPTIMIZED.Nat,
+  Bool: {
+    False: { intr: "False", cond: "not $0" },
+    True: { intr: "True", cond: "$0" },
+  },
+  U32: OPTIMIZED.U32,
+  F32: OPTIMIZED.F32,
+  Char: OPTIMIZED.Char,
+  Array: {
+    ALeaf: { intr: "[$0]", elim: ["$0[0]"], cond: "len($0) == 1" },
+    ANode: {
+      intr: "array_node($0, $1)",
+      elim: ["$0[:len($0) >> 1]", "$0[len($0) >> 1:]"],
+      cond: "len($0) != 1",
+    },
+  },
+  String: {
+    SNil: { intr: "\"\"", cond: "$0 == \"\"" },
+    SCon: {
+      intr: ([h, t]) => STRLIT.test(h) && STRLIT.test(t)
+        ? JSON.stringify(JSON.parse(h) + JSON.parse(t))
+        : `(${h} + ${t})`,
+      elim: ["$0[:1]", "$0[1:]"],
+      cond: "$0 != \"\"",
+    },
+  },
+} satisfies Record<Name, Native>, null);
+
+// py_var/py_call/py_open/py_expr/py_func/py_match/py_def mirror the JS
+// emitter one for one: constructors are tagged dicts, matches are tag
+// tests, a self tail call loops, another tail call bounces through
+// run_tail/run_loop. Python has no switch and no braces, so every emitter
+// below writes an opener ending " {" and a bare "}" closer, the same
+// marker pair block()/emit_chain already write for C and JS; py_text, at
+// the very end, turns that marker pair into Python's own indentation and
+// drops it, so block()/emit_chain need no change for a third backend.
+// $-prefixed JS names (Python has no $) become "__"-prefixed globals and
+// plain v0, v1, pc, t locals; name_local's own "_base_n" names can never
+// collide with either, since they always start with exactly one "_".
+
+function py_var(sc: Scope, k: string): HTerm {
+  if (k === "None") {
+    return Bend.Var(k, 0);
+  }
+  const p = probe(k);
+  JS_DEPTH.set(p, sc.caps?.d ?? 0);
+  return p;
+}
+
+function py_call(sc: Scope, k: Name, args: HTerm[], tail = false): string {
+  if (tail) {
+    memo(FL.tails, sc.seg.def, () => new Set()).add(k);
+  }
+  const tld = FL.book.tlds[k];
+  if (tld?.$ === "ADT") {
+    return "None";
+  }
+  const exprs = args.map((x) => py_expr(sc, x));
+  if (k === CLO_APPLY) {
+    const [f, x] = exprs;
+    return tail ? `run_tail(${f}, ${x})` : `${f}(${x})`;
+  }
+  const intr = intr_of(k, true);
+  if (intr) {
+    return tpl(intr.PY!, exprs.map((e) => ATOM.test(e) || STRLIT.test(e) ? e
+      : emit_hold(sc, [e], "x")[0]));
+  }
+  if (!fun_runs(tld)) {
+    die("a live call into the law " + Bend.name_key(k));
+  }
+  const v = def_foreign(tld) && exprs.length === fun_of(k).lays.length - 1
+    ? name_local(sc, "x") : "";
+  if (v) {
+    exprs.push(v);
+  }
+  const call = `${name_id("__", k)}(${exprs.join(", ")})`;
+  return v ? `lambda ${v}: ${call}`
+    : def_foreign(tld) || tail ? call : `\x01${k}\x02(${call})`;
+}
+
+function py_open(sc: Scope, x: Of<"Let">): HTerm {
+  const on = let_live(x);
+  return x.f(x.v.map((v, j) => !on[j] ? v
+    : py_var(sc, emit_hold(sc, [py_expr(sc, v)], x.k[j])[0])));
+}
+
+function py_num(v: number, f32: boolean): string {
+  if (!f32) {
+    return String(v);
+  }
+  if (Number.isNaN(v)) {
+    return "float('nan')";
+  }
+  if (v === Infinity) {
+    return "float('inf')";
+  }
+  if (v === -Infinity) {
+    return "float('-inf')";
+  }
+  if (Object.is(v, -0)) {
+    return "-0.0";
+  }
+  const s = String(v);
+  return /[.eE]/.test(s) ? s : `${s}.0`;
+}
+
+function py_expr(sc: Scope, tm: HTerm, ty0: HTerm | null = null): string {
+  const [x, ty] = ty_peel(tm, ty0);
+  switch (x.$) {
+    case "Var": {
+      const c = sc.caps;
+      const p = PROBES[x.i];
+      if (c && !c.vs.has(p) && (JS_DEPTH.get(p) ?? c.d) < c.d) {
+        c.vs.set(p, x.k.match(VIEW)?.[2] ?? view_of(x.k) ?? x.k);
+      }
+      return x.k;
+    }
+    case "Ref":
+    case "App": {
+      const m = term_spine(x);
+      if (m.k !== null) {
+        return py_call(sc, m.k, m.xs);
+      }
+      const y = call_eta(x) ?? (m.t.$ !== "Ref" ? m.h : null);
+      if (y !== null) {
+        return py_expr(sc, y, ty);
+      }
+      const k = (m.t as Of<"Ref">).k;
+      if (intr_of(k)?.C === null) {
+        lay_el(m.all[0]);
+      }
+      return py_call(sc, k, m.args);
+    }
+    case "Ctr": {
+      const [adt, u] = ctr_adt(x, ty);
+      if (u !== null) {
+        const v = adt.k === "F32" ? Bend.f32_from_bits(u) : u;
+        return py_num(v, adt.k === "F32");
+      }
+      const exprs = ctr_flds(x.k, x.x).map((f) => py_expr(sc, f));
+      const native = OPTIMIZED_PY[adt.k];
+      if (native) {
+        return tpl(native[x.k].intr, exprs);
+      }
+      // A Python dict has no prototype chain, so a field named __proto__
+      // needs none of js_key's bracket special-case.
+      const fs = ctr_live(FL.book.ctrs[x.k]);
+      return `{"$": "${js_tag(x.k)}"${exprs.map((z, j) =>
+        `, ${JSON.stringify(fs[j][1])}: ${z}`).join("")}}`;
+    }
+    case "Let": {
+      return py_expr(sc, py_open(sc, x), ty);
+    }
+    case "Lam":
+    case "Mat":
+    case "Efq": {
+      if (!fun_live(x, ty)) {
+        return py_expr(sc, (x as Of<"Lam">).f(Bend.Var("None", 0)),
+          ty_all(ty).B(DUMMY));
+      }
+      const arg = name_local(sc, "x");
+      const vs = new Map<HTerm, string>();
+      const cl = { ...sc, seg: seg_new("", BOX, []),
+        caps: { d: (sc.caps?.d ?? 0) + 1, vs } };
+      FL.spins.push(cl.seg);
+      const name = name_id("__", sc.def + "__c" + FL.spins.length);
+      py_func(cl, x, ty, [arg]);
+      const ps = [...new Set(vs.values())];
+      vs.forEach((_, p) => py_expr(sc, p));
+      cl.seg.lines = [`def ${name}(${ps}) {`, `def _cl(${arg}) {`,
+        ...cl.seg.lines, "}", "return _cl", "}"];
+      return `run_clo(${name}(${ps}))`;
+    }
+    default: {
+      return "None";
+    }
+  }
+}
+
+function py_func(sc: Scope, tm: HTerm, ty0: HTerm | null,
+  args: string[]): void {
+  const [x, ty] = ty_peel(tm, ty0);
+  if (args.length === 0 && fun_live(x, ty)) {
+    return file_push(sc, `return ${py_expr(sc, x, ty)};`);
+  }
+  if (x.$ === "Lam") {
+    const all = ty_all(ty);
+    const [e, ...rest] = all.q.$ !== "None" ? args : ["None", ...args];
+    const k = /^(\w*_\d+|None)$/.test(e) || VIEW.test(e) ? e
+      : name_local(sc, x.k);
+    const at = sc.seg.lines.length;
+    const v = py_var(sc, k);
+    py_func(sc, x.f(v), all.B(v), rest);
+    if (k !== e && sc.seg.lines.slice(at).some((l) => l.includes(k))) {
+      sc.seg.lines.splice(at, 0, `${k} = ${e};`);
+    }
+    return;
+  }
+  if (mat_head(x)) {
+    return py_match(sc, x, ty, args);
+  }
+  if (x.$ === "Let") {
+    return py_func(sc, py_open(sc, x), ty, args);
+  }
+  if (args.length > 0) {
+    return py_func(sc, term_eta(x, ty!, 1), ty, args);
+  }
+  const ck = term_spine(x);
+  const loop = loop_of(sc.seg.def);
+  const at = loop.indexOf(ck.k ?? "");
+  if (at >= 0) {
+    ck.xs.map((a) => py_expr(sc, a)).forEach((e, i) =>
+      file_push(sc, `v${i} = ${e};`));
+    return file_push(sc, `${loop.length > 1 ? `pc = ${at}; ` : ""}continue;`);
+  }
+  file_push(sc, `return ${ck.k === null ? py_expr(sc, x, ty)
+    : py_call(sc, ck.k, ck.xs, true)};`);
+}
+
+function py_mat_ops(eq: (k: Name) => string): string {
+  return ["Emit", "Halt", "Exit"].map(eq).join(" or ");
+}
+
+function py_match(sc: Scope, x: HTerm, ty: HTerm | null, args: string[]): void {
+  if (x.$ === "Efq") {
+    return file_push(sc, `raise Exception(${JSON.stringify("bend: " + ERRS[2])});`);
+  }
+  const { adt, ret, rows, cells } = mat_rows(sc, x, ty);
+  const s = emit_alias(sc, args[0], "t");
+  const tab = emit_tab(sc, cells, ret, s);
+  if (tab !== null) {
+    return file_push(sc, `return ${tab};`);
+  }
+  let lv: [string, HTerm, string[]][];
+  if (adt.k === "Nat") {
+    lv = rows!.map(([h, , n, e]) => [`${s} == ${n}`, h,
+      [`(${s} - ${n})`].slice(0, e)]);
+  } else if (rows !== null) {
+    const bits = adt.k === "F32" ? `f32_bits(${s})` : s;
+    const wd = (j: number) =>
+      `u32_to_word(${bits})` + `["tail"]`.repeat(j);
+    lv = rows.map(([h, j, n, e]) => [lits_cond(bits, j, n), h, e === 1
+      ? [wd(j)] : [wd(j) + `["head"]`, wd(j + 1)].slice(0, e)]);
+  } else {
+    const native = OPTIMIZED_PY[adt.k];
+    const is = (c: Name) => `${s}["$"] == "${js_tag(c)}"`;
+    lv = mat_ctrs(x, adt).map(([k, h]) =>
+      k === "" || k === "_" ? [k && py_mat_ops(is), h, [s]] : !native
+      ? [is(k), h, ctr_live(FL.book.ctrs[k]).map(([, f]) => `${s}["${f}"]`)]
+      : [tpl(native[k].cond ?? "", [s]), h,
+        (native[k].elim ?? []).map((e) => tpl(e, [s]))]);
+  }
+  emit_chain(sc, lv.map(([c, h, fs]) => [c, () =>
+    py_func(sc, h, null, [...fs, ...args.slice(1)])]));
+}
+
+// What crosses to or from a host: a Nat comes in as a Python int, which
+// nat_in checks; text gets no change, since a Python str already holds any
+// codepoint as one character, unlike JS's UTF-16 units.
+function py_host(A: HTerm | null, x: string, out = 0): string {
+  const k = ty_adt(A)?.k;
+  return k === "Char" || k === "String" ? `str_${out ? "out" : "in"}(${x})`
+    : k === "Nat" && !out ? `nat_in(${x})`
+    : k === "F32" && !out ? `f32_rewrap(${x})` : x;
+}
+
+function py_def(sc: Scope, k: Name, def: Bend.Def): void {
+  if (intr_of(k, true)) {
+    return;
+  }
+  FUEL = FOLD_FUEL;
+  sc = { ...sc, fresh: new Map(), def: k };
+  sc.seg.def = k;
+  const { live, h } = fun_of(k);
+  const loop = loop_of(k);
+  // A call site passes only as many arguments as its own term needs; the
+  // def itself takes the loop's widest live count, padded with None, as a
+  // JS call already leaves a short trailing argument undefined.
+  const params = loop.length > 0 ? [...Array(Math.max(...loop.map((d) =>
+    fun_of(d).live.length))).keys()].map((i) => "v" + i)
+    : live.map(([, x]) => name_local(sc, x));
+  if (def_foreign(def)) {
+    params.push(name_local(sc, "k"));
+  }
+  const sig = loop.length > 0 ? params.map((p) => p + "=None") : params;
+  block(sc, `def ${name_id("__", k)}(${sig.join(", ")}) {`, () => {
+    if (def_foreign(def)) {
+      const K = ty_wnf(tele_unbind(def.T).doms.at(-1)![2]);
+      return file_push(sc, `return {"$": ${JSON.stringify(k)
+        }, "args": [${live.map(([, , A], i) => py_host(A, params[i], 1))
+        }], "kont": lambda x: ${params.at(-1)}(${py_host(
+        K?.$ === "All" ? K.A : null, "x")})};`);
+    }
+    if (loop.length === 0) {
+      return py_func(sc, h!, def.T, params);
+    }
+    const pc = loop.length > 1;
+    if (pc) {
+      file_push(sc, `pc = ${loop.indexOf(k)};`);
+    }
+    block(sc, "while True {", () =>
+      loop.forEach((d, i) => {
+        memo_gc();
+        FUEL = FOLD_FUEL;
+        const fx = { ...sc, fresh: new Map(), def: d };
+        const ps = fun_of(d).live.map(([, x]) => name_local(fx, x));
+        block(fx, pc ? `${i === 0 ? "if" : "elif"} pc == ${i} {` : "if True {",
+          () => {
+            ps.forEach((p, j) => file_push(fx, `${p} = v${j};`));
+            py_func(fx, fun_of(d).h!, FL.book.tlds[d].T, ps);
+          });
+      }));
+  });
+  file_push(sc, "");
+}
+
+// py_text turns block()/emit_chain's " {" / "}" marker lines into Python
+// indentation: an opener's depth grows after it, a closer's depth shrinks
+// before it, and "else if" becomes "elif". An opener with no line under it
+// gets a "pass", since Python has no empty block.
+function py_text(lines: string[], tab: number): string[] {
+  const rows: [number, string][] = [];
+  for (const raw of lines) {
+    const close = raw.startsWith("}");
+    if (close) {
+      tab -= 1;
+    }
+    let body = close ? raw.slice(1) : raw;
+    const open = body === "{" || body.endsWith(" {");
+    body = open ? (body === "{" ? "" : body.slice(0, -2)) : body;
+    body = body.trim().replace(/^else if /, "elif ");
+    if (body !== "") {
+      rows.push([Math.max(tab, 0), body + (open ? ":" : "")]);
+    }
+    if (open) {
+      tab += 1;
+    }
+  }
+  const out: string[] = [];
+  rows.forEach(([d, l], i) => {
+    out.push("  ".repeat(d) + l);
+    const next = rows[i + 1];
+    if (l.endsWith(":") && (!next || next[0] <= d)) {
+      out.push("  ".repeat(d + 1) + "pass");
+    }
+  });
+  return out;
+}
+
+function py_show_json(show: (number | Name)[] | null): string {
+  return show === null ? "None" : JSON.stringify(show.map((c) =>
+    typeof c === "string" ? [js_tag(c), Bend.name_key(c)] : c));
+}
+
+export function py_lib(book: Bend.Book): string {
+  FL = file_new(book, false, true);
+  file_book(["main"]);
+  const sc = scope_new();
+  for (const [k, def] of done_defs(fun_runs)) {
+    memo_gc();
+    py_def(sc, k, def);
+  }
+  const effs = [...FL.effs.values()]
+    .map(([m, src]) => `${c_ids(src, m)}\n\n`).join("");
+  const jmps = new Map<Name, boolean>();
+  const jmp = (k: Name): boolean => k === CLO_APPLY || memo(jmps, k, () =>
+    (jmps.set(k, true), [...FL.tails.get(k) ?? []].some(jmp)));
+  const funs = [sc.seg, ...FL.spins].flatMap((f) => py_text(f.lines, 0))
+    .join("\n").replace(/\x01([^\x02]*)\x02/g, (_, k) => jmp(k) ? "run_loop"
+      : "");
+  PROBES.length = 1;
+  return RUNTIME_PY + effs + "# Program\n# =======\n\n" + [funs, ...[...FL.tabs]
+    .map(([r, i]) => `TAB_${i} = [${r}]`)].join("\n");
+}
+
+export function py_book(book: Bend.Book): string {
+  const lib = py_lib(book);
+  const show = show_main();
+  return `${lib}\ndef _bend_main():\n    cli(sys.argv)\n    io_exit(${
+    name_id("__", "main")}, ${py_show_json(show)})\n\n\n_bend_run()\n`;
+}
+
+// RuntimePy
+// =========
+
+// Bend's String is Char list-like text; char_new/char_code round-trip a
+// codepoint through chr()/ord() directly, since a Python str already
+// indexes by codepoint, not by UTF-16 unit as a JS string does. This
+// drops JS's surrogate-packing for a Char past the Unicode scalars (over
+// 0x10FFFF): chr() rejects it, a divergence from JS noted, not chased,
+// for this spike.
+
+const RUNTIME_PY: string = String.raw`
+import math
+import os
+import re
+import struct
+import sys
+import threading
+
+# Native
+# ======
+
+def f32_rewrap(x):
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.inf if x > 0 else -math.inf
+
+def f32_bits(x):
+    return struct.unpack("<I", struct.pack("<f", f32_rewrap(x)))[0]
+
+def f32_from_bits(u):
+    return struct.unpack("<f", struct.pack("<I", u))[0]
+
+def f32_div(a, b):
+    if b == 0:
+        if a == 0 or a != a:
+            return math.nan
+        return math.copysign(math.inf, a) * math.copysign(1.0, b)
+    return a / b
+
+def f32_mod(a, b):
+    if b == 0 or a != a or b != b or math.isinf(a):
+        return math.nan
+    if math.isinf(b):
+        return a
+    return math.fmod(a, b)
+
+def f32_pow(b, e):
+    if b == 1 or (b == -1 and math.isinf(e)):
+        return 1.0
+    try:
+        r = b ** e
+    except OverflowError:
+        return math.inf
+    return math.nan if isinstance(r, complex) else r
+
+def f32_sqrt(x):
+    if x != x or x < 0:
+        return math.nan
+    return math.sqrt(x)
+
+def f32_log(x):
+    if x != x or x < 0:
+        return math.nan
+    if x == 0:
+        return -math.inf
+    if math.isinf(x):
+        return math.inf
+    return math.log(x)
+
+def f32_log2(x):
+    if x != x or x < 0:
+        return math.nan
+    if x == 0:
+        return -math.inf
+    if math.isinf(x):
+        return math.inf
+    return math.log2(x)
+
+def f32_log10(x):
+    if x != x or x < 0:
+        return math.nan
+    if x == 0:
+        return -math.inf
+    if math.isinf(x):
+        return math.inf
+    return math.log10(x)
+
+def f32_asin(x):
+    if x != x or x < -1 or x > 1:
+        return math.nan
+    return math.asin(x)
+
+def f32_acos(x):
+    if x != x or x < -1 or x > 1:
+        return math.nan
+    return math.acos(x)
+
+def f32_trig(f, x):
+    if x != x or math.isinf(x):
+        return math.nan
+    return f(x)
+
+def f32_exp(x):
+    if x != x:
+        return x
+    if x == math.inf:
+        return math.inf
+    if x == -math.inf:
+        return 0.0
+    try:
+        return math.exp(x)
+    except OverflowError:
+        return math.inf
+
+def f32_round_updown(f, x):
+    if x != x or math.isinf(x):
+        return x
+    return float(f(x))
+
+def f32_round(s):
+    v = float(s)
+    try:
+        return struct.unpack("<f", struct.pack("<f", v))[0]
+    except OverflowError:
+        return math.inf if v > 0 else -math.inf
+
+# JS's Number::toString: given an exact significant-digit string and its
+# decimal exponent (both known exactly from Python's own "%e" formatting,
+# so no re-parse through repr() and its own, different thresholds), picks
+# plain decimal up to 10^21 and down to 10^-6, else scientific notation
+# with no zero-padded exponent, unlike Python's.
+def _js_num_from_sci(sci):
+    neg = sci.startswith("-")
+    mantissa, exp = sci[1 if neg else 0:].split("e")
+    exp = int(exp)
+    ip, _, fp = mantissa.partition(".")
+    digits = (ip + fp).rstrip("0") or "0"
+    k = len(digits)
+    n = exp + 1
+    sign = "-" if neg else ""
+    if k <= n <= 21:
+        return sign + digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return sign + digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return sign + "0." + "0" * -n + digits
+    e = n - 1
+    mant = digits[0] + ("." + digits[1:] if k > 1 else "")
+    return sign + mant + "e" + ("+" if e >= 0 else "-") + str(abs(e))
+
+def f32_show(x):
+    if x != x:
+        return "nan"
+    if x == math.inf:
+        return "inf"
+    if x == -math.inf:
+        return "-inf"
+    if x == 0:
+        return "-0" if math.copysign(1.0, x) < 0 else "0"
+    s = "nan"
+    for p in range(1, 10):
+        if f32_round(s) == x:
+            break
+        s = _js_num_from_sci(format(x, "." + str(p - 1) + "e"))
+    return s
+
+def f32_read(s):
+    t = str_out(s)
+    if not re.match(
+        r"^[\t\n\x0b\x0c\r ]*[+-]?((\d+(\.\d*)?|\.\d+)(e[+-]?\d+)?|inf(inity)?|nan)$",
+        t, re.IGNORECASE,
+    ):
+        return {"$": "None"}
+    return {"$": "Some", "value": f32_round(t)}
+
+def cmp_new(a, b):
+    return {"$": "LT" if a < b else "EQ" if a == b else "GT"}
+
+def nat_divmod(a, b):
+    if b == 0:
+        return {"$": "Tuple", "fst": 0, "snd": a}
+    return {"$": "Tuple", "fst": a // b, "snd": a % b}
+
+def nat_chk(n):
+    if n > 281474976710655:
+        raise Exception("bend: ${ERRS[5]}")
+    return n
+
+def nat_in(n):
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0 or n > 2 ** 53:
+        raise Exception("bend: expected a Nat host number: an integer from 0 to 2^53")
+    return n
+
+def u32_to_word(x):
+    w = {"$": "WNil"}
+    for i in range(31, -1, -1):
+        w = {"$": "WCon", "head": ((x >> i) & 1) == 1, "tail": w}
+    return w
+
+def word_to_u32(w):
+    x = 0
+    i = 0
+    while w["$"] == "WCon":
+        if w["head"]:
+            x |= 1 << i
+        i += 1
+        w = w["tail"]
+    return x & 0xFFFFFFFF
+
+def char_new(c):
+    return chr(c)
+
+def char_code(s):
+    return ord(s)
+
+def string_contains(s, p):
+    return p in s
+
+def str_out(s):
+    return s
+
+def str_in(s):
+    return s
+
+# Array
+# =====
+
+def array_new(d, v):
+    if d > 31:
+        raise Exception("bend: ${ERRS[8]}")
+    return [v] * (2 ** d)
+
+def array_node(a, b):
+    if len(a) != len(b):
+        raise Exception("bend: ${ERRS[2]}")
+    return a + b
+
+def array_rmw(a, i, f):
+    at = i % len(a)
+    old = a[at]
+    a[at] = f(old)
+    return {"$": "Tuple", "fst": a, "snd": old}
+
+def array_set(a, i, v):
+    a[i % len(a)] = v
+    return a
+
+# Run
+# ===
+
+def run_tail(f, x):
+    j = getattr(f, "j", None)
+    return {"$": "$JMP",
+        "f": j if j is not None and getattr(j, "f", None) is f else f, "x": x}
+
+def run_clo(j):
+    def f(x):
+        return run_loop(j(x))
+    f.j = j
+    j.f = f
+    return f
+
+def run_loop(r):
+    while isinstance(r, dict) and r.get("$") == "$JMP":
+        r = r["f"](r["x"])
+    return r
+
+# Effect
+# ======
+
+_io_eff = {}
+
+def io_eff(k, run):
+    if k in _io_eff:
+        raise Exception("bend: two effects register " + k)
+    _io_eff[k] = run
+
+# Cli
+# ===
+
+cli_args = []
+
+def cli(argv):
+    rts = False
+    cli_args.append(argv[0])
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--RTS":
+            cli_args.extend(argv[i + 1:])
+            break
+        elif a in ("+RTS", "-RTS"):
+            rts = a == "+RTS"
+        elif not rts:
+            cli_args.append(a)
+        i += 1
+
+# Show
+# ====
+
+def show_chr(s, q):
+    c = char_code(s)
+    special = {10: "n", 9: "t", 13: "r", 0: "0", 92: "\\"}
+    if c in special:
+        return "\\" + special[c]
+    if s == q:
+        return "\\" + q
+    if c < 32 or c == 127:
+        return "\\u{%x}" % c
+    return s
+
+def show_val(D, d, v, chain):
+    k = D[d]
+    if k == 7:
+        fs = list({"$": "True" if v else "False"}.values()) \
+            if isinstance(v, bool) else list(v.values())
+        a = d + 3
+        while D[a + 1][0] != fs[0]:
+            a += 4 + 2 * D[a + 2]
+        o = "{[("[D[a + 3]]
+        if o == "{":
+            s = D[a + 1][1] + "{"
+        elif chain == o:
+            s = ""
+        else:
+            s = o
+        for j, f in enumerate(fs[1:]):
+            cond = (j == 0 and chain == o) if o == "[" else (j > 0)
+            if cond:
+                s += ", "
+            s += show_val(D, D[a + 5 + 2 * j], f,
+                (o if (j == 1 and o != "{") else 0))
+        if o == "{" or chain != o:
+            return s + "}])"[D[a + 3]]
+        return s
+    if k == 0:
+        return str(v)
+    if k == 1:
+        return re.sub(r"^-?\d+(?=e|$)", lambda m: m.group(0) + ".0", f32_show(v))
+    if k == 2:
+        return str(v) + "n"
+    if k == 3:
+        return "'" + show_chr(v, "'") + "'"
+    if k == 4:
+        return '"' + "".join(show_chr(c, '"') for c in v) + '"'
+    if k == 5:
+        return "{==}"
+    return "[" + ", ".join(show_val(D, D[d + 1], x, 0) for x in v) + "]"
+
+# Io
+# ==
+
+def io_exit(main, show):
+    try:
+        if show is not None:
+            io_out(1, io_bytes(show_val(show, 0, run_loop(main()), 0) + "\n"))
+            sys.exit(0)
+        sys.exit(io_run(main))
+    except SystemExit:
+        raise
+    except Exception as e:
+        io_errs(str(e))
+        sys.exit(1)
+
+def io_out(fd, data):
+    f = sys.stdout.buffer if fd == 1 else sys.stderr.buffer
+    try:
+        f.write(data)
+        f.flush()
+    except BrokenPipeError:
+        sys.exit(1)
+
+def io_errs(message):
+    io_out(2, io_bytes(message + "\n"))
+
+def io_bytes(text):
+    return str_out(text).encode("utf-8")
+
+def io_list(b, n):
+    xs = {"$": "Nil"}
+    i = n
+    while i > 0:
+        i -= 1
+        xs = {"$": "Con", "head": b[i], "tail": xs}
+    return xs
+
+def io_unlist(xs):
+    b = []
+    while xs["$"] == "Con":
+        b.append(xs["head"])
+        xs = xs["tail"]
+    return None if any(x > 255 for x in b) else bytes(b)
+
+def io_tup(*xs):
+    r = xs[-1]
+    for v in reversed(xs[:-1]):
+        r = {"$": "Tuple", "fst": v, "snd": r}
+    return r
+
+def io_done(value):
+    return {"$": "Done", "value": value}
+
+def io_fail(code, *rest):
+    try:
+        text = os.strerror(code)
+    except ValueError:
+        text = "errno " + str(code)
+    return {"$": "Fail", "error": io_tup(io_tup(code & 0xFFFFFFFF, text), *rest)}
+
+_io_active = None
+
+def io_push(fun, arg, fresh, io):
+    io["runs"].append((fun, arg))
+    if fresh:
+        io["live"] += 1
+
+def io_run(m):
+    global _io_active
+    io = {"runs": [], "live": 0}
+    parent = _io_active
+    _io_active = io
+    try:
+        io_push(run_loop(m()), lambda x: {"$": "Emit", "value": x}, True, io)
+        while True:
+            if len(io["runs"]) == 0:
+                if io["live"] == 0:
+                    return 0
+                raise Exception(
+                    "bend: deadlock: every computation waits on a channel")
+            fun, arg = io["runs"].pop(0)
+            op = fun(arg)
+            left = 64
+            while op is not None:
+                if op["$"] == "Emit":
+                    io["live"] -= 1
+                    break
+                if op["$"] == "Halt" or op["$"] == "Exit":
+                    if op["$"] == "Halt":
+                        io_errs(op["message"])
+                    if op["code"] > 255:
+                        io_errs("bend: exit code must be in 0..255")
+                        return 1
+                    return op["code"]
+                run = _io_eff.get(op["$"])
+                if run is None:
+                    raise Exception("bend: no effect registers " + op["$"])
+                x = run(*op["args"], op["kont"])
+                if x is None:
+                    raise Exception("bend: " + op["$"]
+                        + " takes no need: an effect that waits parks itself")
+                left -= 1
+                if left == 1:
+                    io_push(op["kont"], x, False, io)
+                    break
+                op = op["kont"](x)
+    except RecursionError:
+        raise Exception("bend: ${ERRS[7]}")
+    finally:
+        io["done"] = True
+        _io_active = parent
+
+def _bend_run():
+    sys.setrecursionlimit(1000000)
+    for mb in (512, 256, 64):
+        try:
+            threading.stack_size(mb * 1024 * 1024)
+            sys.setrecursionlimit(mb * 256)
+            break
+        except (ValueError, RuntimeError):
+            continue
+    code = [0]
+    def target():
+        try:
+            _bend_main()
+        except SystemExit as e:
+            code[0] = e.code if isinstance(e.code, int) \
+                else (0 if e.code is None else 1)
+    t = threading.Thread(target=target)
+    t.start()
+    t.join()
+    sys.exit(code[0])
+
+`.slice(1);
 
 // RuntimeC
 // ========
