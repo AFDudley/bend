@@ -2879,8 +2879,13 @@ function emit_chain(sc: Scope, arms: [string, () => void][]): void {
 
 const ID_WORDS = /\/\/.*|\/\*[^]*?\*\/|"(?:\\[^]|[^"\\\n])*"|'(?:\\[^]|[^'\\\n])*'|`(?:\\[^]|[^`\\])*`|(?<![$\u200c\u200d\p{ID_Continue}])([CF]ID)\(([\w./~-]+)\)/gu;
 
+// Python has no // or /* */ comment, but # to end of line, and a triple-
+// quoted string holds no escape the way C/JS's do here; a CID(...) or
+// FID(...) inside either must stay untouched, the same as a JS //  one.
+const ID_WORDS_PY = /#.*|"""[^]*?"""|'''[^]*?'''|"(?:\\[^]|[^"\\\n])*"|'(?:\\[^]|[^'\\\n])*'|(?<![$\u200c\u200d\p{ID_Continue}])([CF]ID)\(([\w./~-]+)\)/gu;
+
 function c_ids(src: string, m = "", use?: (p: string, k: Name) => void): string {
-  return src.replace(ID_WORDS, (t, p, k, at) => {
+  return src.replace(FL.py ? ID_WORDS_PY : ID_WORDS, (t, p, k, at) => {
     // '#' starts a private JS name; C's ## may paste an ID macro.
     if (!p || !k || (FL.js && src[at - 1] === "#")) {
       return t;
@@ -3753,10 +3758,14 @@ function py_match(sc: Scope, x: HTerm, ty: HTerm | null, args: string[]): void {
 
 // What crosses to or from a host: a Nat comes in as a Python int, which
 // nat_in checks; text gets no change, since a Python str already holds any
-// codepoint as one character, unlike JS's UTF-16 units.
+// codepoint as one character, unlike JS's UTF-16 units. A Char is a plain
+// int at Python runtime (see char_new/char_code above), not a str, so it
+// crosses through its own packed-string form: out, pack then FFFD-guard;
+// in, FFFD-guard then unpack.
 function py_host(A: HTerm | null, x: string, out = 0): string {
   const k = ty_adt(A)?.k;
-  return k === "Char" || k === "String" ? `str_${out ? "out" : "in"}(${x})`
+  return k === "Char" ? (out ? `str_out(char_new(${x}))` : `char_code(str_in(${x}))`)
+    : k === "String" ? `str_${out ? "out" : "in"}(${x})`
     : k === "Nat" && !out ? `nat_in(${x})`
     : k === "F32" && !out ? `f32_rewrap(${x})` : x;
 }
@@ -3867,8 +3876,17 @@ export function py_lib(book: Bend.Book, mod = false): string {
     memo_gc();
     py_def(sc, k, def);
   }
-  const effs = [...FL.effs.values()]
-    .map(([m, src]) => `${c_ids(src, m)}\n\n`).join("");
+  // Each effect source keeps its own scope, the way a JS IIFE does: two
+  // files may define the same local name (effect_helper_collision's two
+  // a_run_helper, one per file) without one clobbering the other's, or the
+  // runtime's own.
+  let eff_scope = 0;
+  const effs = [...FL.effs.values()].map(([m, src]) => {
+    const name = "_eff_scope" + eff_scope++;
+    const body = c_ids(src, m).split("\n")
+      .map((l) => l === "" ? l : "    " + l).join("\n");
+    return `def ${name}():\n${body}\n${name}()\n\n`;
+  }).join("");
   const lib = outs === null ? "" : "\n" + outs.map((k) => {
     const { live, lays } = fun_of(k);
     const ps = live.map((_, i) => "a" + i);
