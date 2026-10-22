@@ -3683,27 +3683,39 @@ function py_match(sc: Scope, x: HTerm, ty: HTerm | null, args: string[]): void {
   if (tab !== null) {
     return file_push(sc, `return ${tab};`);
   }
-  let lv: [string, HTerm, string[]][];
+  const call = (h: HTerm, fs: string[]) => () =>
+    py_func(sc, h, null, [...fs, ...args.slice(1)]);
   if (adt.k === "Nat") {
-    lv = rows!.map(([h, , n, e]) => [`${s} == ${n}`, h,
-      [`(${s} - ${n})`].slice(0, e)]);
-  } else if (rows !== null) {
+    return emit_chain(sc, rows!.map(([h, , n, e]): [string, () => void] =>
+      [`${s} == ${n}`, call(h, [`(${s} - ${n})`].slice(0, e))]));
+  }
+  if (rows !== null) {
     const bits = adt.k === "F32" ? `f32_bits(${s})` : s;
     const wd = (j: number) =>
       `u32_to_word(${bits})` + `["tail"]`.repeat(j);
-    lv = rows.map(([h, j, n, e]) => [lits_cond(bits, j, n), h, e === 1
-      ? [wd(j)] : [wd(j) + `["head"]`, wd(j + 1)].slice(0, e)]);
-  } else {
-    const native = OPTIMIZED_PY[adt.k];
-    const is = (c: Name) => `${s}["$"] == "${js_tag(c)}"`;
-    lv = mat_ctrs(x, adt).map(([k, h]) =>
-      k === "" || k === "_" ? [k && py_mat_ops(is), h, [s]] : !native
-      ? [is(k), h, ctr_live(FL.book.ctrs[k]).map(([, f]) => `${s}["${f}"]`)]
-      : [tpl(native[k].cond ?? "", [s]), h,
-        (native[k].elim ?? []).map((e) => tpl(e, [s]))]);
+    // A row with e === 2 reads the word at depth j twice: the bit at j
+    // (the head) and the rest from j + 1 on (the tail). One bound local
+    // for that node, read both ways, replaces a second full
+    // u32_to_word rebuild of the 32-node chain (#1122 profile:
+    // tcp_text_residue's 1.2M u32_to_word calls, 2.30 s, to 600k, its
+    // dominant cost).
+    return emit_chain(sc, rows.map(([h, j, n, e]): [string, () => void] => {
+      if (e !== 2) {
+        return [lits_cond(bits, j, n), call(h, e === 1 ? [wd(j)] : [])];
+      }
+      return [lits_cond(bits, j, n), () => {
+        const w = emit_hold(sc, [wd(j)], "w")[0];
+        call(h, [`${w}["head"]`, `${w}["tail"]`])();
+      }];
+    }));
   }
-  emit_chain(sc, lv.map(([c, h, fs]) => [c, () =>
-    py_func(sc, h, null, [...fs, ...args.slice(1)])]));
+  const native = OPTIMIZED_PY[adt.k];
+  const is = (c: Name) => `${s}["$"] == "${js_tag(c)}"`;
+  emit_chain(sc, mat_ctrs(x, adt).map(([k, h]): [string, () => void] =>
+    k === "" || k === "_" ? [k && py_mat_ops(is), call(h, [s])] : !native
+    ? [is(k), call(h, ctr_live(FL.book.ctrs[k]).map(([, f]) => `${s}["${f}"]`))]
+    : [tpl(native[k].cond ?? "", [s]),
+      call(h, (native[k].elim ?? []).map((e) => tpl(e, [s])))]));
 }
 
 // What crosses to or from a host: a Nat comes in as a Python int, which
@@ -3742,10 +3754,12 @@ function py_def(sc: Scope, k: Name, def: Bend.Def): void {
   block(sc, `def ${name_id("__", k)}(${sig.join(", ")}) {`, () => {
     if (def_foreign(def)) {
       const K = ty_wnf(tele_unbind(def.T).doms.at(-1)![2]);
+      const kx = py_host(K?.$ === "All" ? K.A : null, "x");
+      const kont = kx === "x" ? params.at(-1)!
+        : `lambda x: ${params.at(-1)}(${kx})`;
       return file_push(sc, `return {"$": ${JSON.stringify(k)
         }, "args": [${live.map(([, , A], i) => py_host(A, params[i], 1))
-        }], "kont": lambda x: ${params.at(-1)}(${py_host(
-        K?.$ === "All" ? K.A : null, "x")})};`);
+        }], "kont": ${kont}};`);
     }
     if (loop.length === 0) {
       return py_func(sc, h!, def.T, params);
@@ -4196,10 +4210,17 @@ def array_set(a, i, v):
 # Run
 # ===
 
+# A tail jump is an (f, x) tuple: every Bend value at Python runtime is an
+# int, float, str, list, dict or None, never a tuple, so run_loop tells a
+# jump from a real value by type alone. A dict with a "$" key, the first
+# design, cost a hash-table alloc and two lookups per jump; the tuple costs
+# one alloc and a type check (#1122 profile: 3.69 s to 3.35 s on
+# io_within_busy's 500k-value pipeline, alone, measured with this change by
+# itself, before the foreign-effect kont-lambda fix in py_def took it
+# further).
 def run_tail(f, x):
     j = getattr(f, "j", None)
-    return {"$": "$JMP",
-        "f": j if j is not None and getattr(j, "f", None) is f else f, "x": x}
+    return (j, x) if j is not None and getattr(j, "f", None) is f else (f, x)
 
 def run_clo(j):
     def f(x):
@@ -4209,8 +4230,9 @@ def run_clo(j):
     return f
 
 def run_loop(r):
-    while isinstance(r, dict) and r.get("$") == "$JMP":
-        r = r["f"](r["x"])
+    while type(r) is tuple:
+        f, x = r
+        r = f(x)
     return r
 
 # Effect
