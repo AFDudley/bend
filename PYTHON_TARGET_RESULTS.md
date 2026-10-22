@@ -170,22 +170,20 @@ unattempted.
 true)` mirrors `js_lib(book, true)`, rooting every public, non-base,
 non-IO def and exporting it as a plain top-level Python function (a
 dot in the name becomes an underscore; no currying, unlike JS's `run_
-lib` — every live argument at once, an ordinary Python call). Example,
-run this session:
+lib` — every live argument at once, an ordinary Python call). `-o
+x.pym` writes to `x.py` (the request keeps its `.pym` spelling; the
+file on disk does not), since Python's `import` statement, unlike
+Node's, reads only the `.py` suffix, with no `.mjs`/`.cjs`-style dual
+extension. Example, run this session:
 
     def square(x): U32.mul(x, x)      # Bend, with a law marking x duplicable
     def greet(name: String) -> String: "hello, " ++ name
 
     $ bun bend2/main.ts mod.bend -o mod.pym
-    $ cp mod.pym mod.py   # Python's own `import` reads only .py
     $ python3 -c "import mod; print(mod.square(7)); print(mod.greet('world'))"
     49
     hello, world
 
-  (Python's `import` statement, unlike Node's, recognizes only the
-  `.py` suffix; `.pym` needs a rename or `importlib.util.spec_from_
-  file_location`, noted here since there is no Python analogue to
-  Node's dual `.mjs`/`.cjs` extension recognition.)
 
 **d. Deep recursion stress test**, run on both lanes, same programs,
 not added to `tests/` (`.scratch/stress/`, gitignored): `List.foldr`

@@ -389,7 +389,11 @@ function cli_emit(book: Bend.Book, out: string): void {
   } else if (/\.c?js$/.test(out)) {
     fs.writeFileSync(out, Comp.js_book(book));
   } else if (out.endsWith(".pym")) {
-    fs.writeFileSync(out, Comp.py_lib(book, true));
+    // Python's import statement reads only the .py suffix, unlike
+    // Node's .mjs/.cjs pair: the module itself writes to out with its
+    // last letter cut, so -o x.pym leaves an x.py a plain import x
+    // reads with no rename step.
+    fs.writeFileSync(out.slice(0, -1), Comp.py_lib(book, true));
   } else if (out.endsWith(".py")) {
     fs.writeFileSync(out, Comp.py_book(book));
   } else if (out.endsWith(".c")) {

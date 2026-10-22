@@ -26,7 +26,6 @@ def add(a: Nat, b: Nat) -> Nat:
             env={**os.environ, "HOME": dir, "BEND_ORIGIN": "http://127.0.0.1:9"})
         if built.returncode != 0:
             return 1
-        shutil.copyfile(output, os.path.join(dir, "lib.py"))
         sys.path.insert(0, dir)
         try:
             lib = importlib.import_module("lib")
