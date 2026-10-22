@@ -3,6 +3,7 @@ def receive(c, k):
         raise Exception("the send parked")
     def more():
         _io_eff[CID(Chan.send)](c, 7, send_kont)
+        return PARKED
     io_park_on(None, False, k, more, io_until(1))
     answer = _io_eff[CID(Chan.try_recv)](c, 10, k)
     time.sleep(0.02)
