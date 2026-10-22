@@ -54,8 +54,6 @@ def flag(c: A.Flag) -> U32:
                     "BEND_ORIGIN": "http://127.0.0.1:9"})
             if built.returncode != 0:
                 return 1
-            shutil.copyfile(os.path.join(dir, name + ".pym"),
-                os.path.join(dir, name + ".py"))
         sys.path.insert(0, dir)
         try:
             A = importlib.import_module("a")
