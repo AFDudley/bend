@@ -35,6 +35,6 @@ def tcp_connect(host, port, k):
         return end(code)
     _sockets[fd] = s
     io_park_on(fd, True, k, lambda: end(error()), None)
-    return None
+    return PARKED
 
 io_eff(CID(TCP.connect), tcp_connect)

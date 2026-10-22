@@ -20,7 +20,7 @@ def udp_send_to_with(socket_v, host, port, data, b, k, at=None):
             if io_late(at):
                 return io_tup(socket_v, {"$": CID(Wait), "rest": data})
             io_park_on(fd, True, k, go, at)
-            return None
+            return PARKED
         return io_tup(socket_v, io_ready(at, io_done({"$": CID(Unit)})))
     return go()
 
