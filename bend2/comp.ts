@@ -3856,6 +3856,7 @@ export function py_book(book: Bend.Book): string {
 // boundary.
 
 const RUNTIME_PY: string = String.raw`
+import collections
 import errno
 import math
 import os
@@ -4433,7 +4434,7 @@ def io_wait(io, block):
 
 def io_run(m):
     global _io_active
-    io = {"runs": [], "live": 0, "waits": []}
+    io = {"runs": collections.deque(), "live": 0, "waits": []}
     parent = _io_active
     _io_active = io
     try:
@@ -4456,7 +4457,7 @@ def io_run(m):
                     look = now + 10
                     io_wait(io, False)
             n += 1
-            fun, arg = io["runs"].pop(0)
+            fun, arg = io["runs"].popleft()
             op = fun(arg)
             left = 64
             while op is not None:
