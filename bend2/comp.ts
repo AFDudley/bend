@@ -3849,9 +3849,19 @@ function py_show_json(show: (number | Name)[] | null): string {
     typeof c === "string" ? [js_tag(c), Bend.name_key(c)] : c));
 }
 
-export function py_lib(book: Bend.Book): string {
+// A module (for -o <out>.pyl, mirroring js_lib(book, true)'s -o <out>.mjs)
+// roots and exports each callable def by its book name, sanitized to a
+// valid Python identifier (a dot becomes an underscore): "import t" then
+// "t.List_map(...)" calls it with every live argument at once (no currying:
+// an ordinary Python call, not JS's partial-application run_lib).
+export function py_lib(book: Bend.Book, mod = false): string {
   FL = file_new(book, false, true);
-  file_book(["main"]);
+  const outs = !mod ? null : [...new Set(FL.book.order)].filter((k) => {
+    const t = FL.book.tlds[k];
+    return done_live(t) && !t.b && t.x === 0
+      && io_base(FL.book, t.T) === null;
+  });
+  file_book(outs ?? ["main"]);
   const sc = scope_new();
   for (const [k, def] of done_defs(fun_runs)) {
     memo_gc();
@@ -3859,6 +3869,14 @@ export function py_lib(book: Bend.Book): string {
   }
   const effs = [...FL.effs.values()]
     .map(([m, src]) => `${c_ids(src, m)}\n\n`).join("");
+  const lib = outs === null ? "" : "\n" + outs.map((k) => {
+    const { live, lays } = fun_of(k);
+    const ps = live.map((_, i) => "a" + i);
+    const xs = live.map(([, , A], i) => py_host(A, ps[i]));
+    const call = `run_loop(${name_id("__", k)}(${xs.join(", ")}))`;
+    const ret = py_host(tele_unbind(FL.book.tlds[k].T).ret, call, 1);
+    return `def ${name_clean(k)}(${ps.join(", ")}):\n    return ${ret}\n`;
+  }).join("\n");
   const jmps = new Map<Name, boolean>();
   const jmp = (k: Name): boolean => k === CLO_APPLY || memo(jmps, k, () =>
     (jmps.set(k, true), [...FL.tails.get(k) ?? []].some(jmp)));
@@ -3867,7 +3885,7 @@ export function py_lib(book: Bend.Book): string {
       : "");
   PROBES.length = 1;
   return RUNTIME_PY + effs + "# Program\n# =======\n\n" + [funs, ...[...FL.tabs]
-    .map(([r, i]) => `TAB_${i} = [${r}]`)].join("\n");
+    .map(([r, i]) => `TAB_${i} = [${r}]`)].join("\n") + lib;
 }
 
 export function py_book(book: Bend.Book): string {
@@ -3880,20 +3898,24 @@ export function py_book(book: Bend.Book): string {
 // RuntimePy
 // =========
 
-// Bend's String is Char list-like text; char_new/char_code round-trip a
-// codepoint through chr()/ord() directly, since a Python str already
-// indexes by codepoint, not by UTF-16 unit as a JS string does. This
-// drops JS's surrogate-packing for a Char past the Unicode scalars (over
-// 0x10FFFF): chr() rejects it, a divergence from JS noted, not chased,
-// for this spike.
+// Char is a plain int everywhere (see char_new/char_code below): the full
+// 21-bit word round-trips, with no cap at Python's chr() limit (0x10FFFF).
+// String stays a native Python str; char_new/char_code pack an
+// out-of-range or surrogate code the same 4-unit sentinel way the JS
+// runtime packs it into UTF-16, converting only at the Char<->String
+// boundary.
 
 const RUNTIME_PY: string = String.raw`
+import errno
 import math
 import os
 import re
+import select
+import socket as _socketlib
 import struct
 import sys
 import threading
+import time
 from fractions import Fraction
 
 # Native
@@ -4332,6 +4354,9 @@ def io_errs(message):
 def io_bytes(text):
     return str_out(text).encode("utf-8")
 
+def io_text(b, n):
+    return bytes(b[:n]).decode("utf-8", errors="replace")
+
 def io_list(b, n):
     xs = {"$": "Nil"}
     i = n
@@ -4363,6 +4388,41 @@ def io_fail(code, *rest):
         text = "errno " + str(code)
     return {"$": "Fail", "error": io_tup(io_tup(code & 0xFFFFFFFF, text), *rest)}
 
+# Socket
+# ======
+
+# A socket or a listener is a raw fd on the JS lane (through its own
+# syscalls); here it is a Python socket.socket, set non-blocking for
+# life once accepted or connected, kept in a registry keyed by its fd so
+# a Bend-visible handle stays a plain int, as the JS lane's does.
+_sockets = {}
+
+def sock_reg(sock):
+    sock.setblocking(False)
+    fd = sock.fileno()
+    _sockets[fd] = sock
+    return fd
+
+def sock_of(fd):
+    return _sockets[fd]
+
+def sock_close(fd):
+    s = _sockets.pop(fd, None)
+    if s is not None:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+def sock_addr_ok(host, port):
+    parts = host.split(".")
+    def deci(p):
+        return bool(re.fullmatch(r"0|[1-9]\d{0,2}", p)) and int(p) < 256
+    return port <= 65535 and len(parts) == 4 and all(deci(p) for p in parts)
+
+EAGAIN = errno.EAGAIN
+EINPROGRESS = errno.EINPROGRESS
+
 _io_active = None
 
 def io_push(fun, arg, fresh, io):
@@ -4370,19 +4430,82 @@ def io_push(fun, arg, fresh, io):
     if fresh:
         io["live"] += 1
 
+def io_until(ms):
+    return time.monotonic() * 1000 + float(ms)
+
+def io_late(at):
+    return at is not None and time.monotonic() * 1000 >= at
+
+def io_ready(at, r):
+    return r if at is None else {"$": "Ready", "value": r}
+
+# A wait is {"fd": int|None, "out": bool, "k": kont, "more": callable, "at":
+# float|None}: fd for a read/write-ready file descriptor, at for a
+# deadline, in io.monotonic() milliseconds.
+def io_park_on(fd, out, k, more, at):
+    ws = _io_active["waits"]
+    i = -1
+    for j, w in enumerate(ws):
+        if (w["at"] if w["at"] is not None else math.inf) <= (
+            at if at is not None else math.inf):
+            i = j
+    ws.insert(i + 1, {"fd": fd, "out": out, "k": k, "more": more, "at": at})
+
+def io_wait(io, block):
+    soon = io["waits"][0]["at"] if io["waits"] else None
+    if not block:
+        timeout = 0.0
+    elif soon is None:
+        timeout = None
+    else:
+        timeout = max(0.0, soon - time.monotonic() * 1000) / 1000
+    rfds = [w["fd"] for w in io["waits"] if w["fd"] is not None and not w["out"]]
+    wfds = [w["fd"] for w in io["waits"] if w["fd"] is not None and w["out"]]
+    ready_r, ready_w = set(), set()
+    if rfds or wfds:
+        ready_r_l, ready_w_l, _ = select.select(rfds, wfds, [], timeout)
+        ready_r, ready_w = set(ready_r_l), set(ready_w_l)
+    elif timeout:
+        time.sleep(timeout)
+    now = time.monotonic() * 1000
+    todo = io["waits"]
+    due = []
+    keep = []
+    for w in todo:
+        is_due = (w["at"] is not None and w["at"] <= now) or (
+            w["fd"] is not None and w["fd"] in (ready_w if w["out"] else ready_r))
+        (due if is_due else keep).append(w)
+    io["waits"] = keep
+    for w in due:
+        x = w["more"]()
+        if x is not None:
+            io_push(w["k"], x, False, io)
+
 def io_run(m):
     global _io_active
-    io = {"runs": [], "live": 0}
+    io = {"runs": [], "live": 0, "waits": []}
     parent = _io_active
     _io_active = io
     try:
         io_push(run_loop(m()), lambda x: {"$": "Emit", "value": x}, True, io)
+        look = 0.0
+        n = 0
         while True:
             if len(io["runs"]) == 0:
                 if io["live"] == 0:
                     return 0
-                raise Exception(
-                    "bend: deadlock: every computation waits on a channel")
+                if len(io["waits"]) == 0:
+                    raise Exception(
+                        "bend: deadlock: every computation waits on a channel")
+                io_wait(io, True)
+                continue
+            if (n & 63) == 0 and io["waits"]:
+                now = time.monotonic() * 1000
+                if now >= look or io["waits"][0]["at"] is not None and \
+                    io["waits"][0]["at"] <= now:
+                    look = now + 10
+                    io_wait(io, False)
+            n += 1
             fun, arg = io["runs"].pop(0)
             op = fun(arg)
             left = 64
@@ -4402,8 +4525,7 @@ def io_run(m):
                     raise Exception("bend: no effect registers " + op["$"])
                 x = run(*op["args"], op["kont"])
                 if x is None:
-                    raise Exception("bend: " + op["$"]
-                        + " takes no need: an effect that waits parks itself")
+                    break
                 left -= 1
                 if left == 1:
                     io_push(op["kont"], x, False, io)
