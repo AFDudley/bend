@@ -16,7 +16,7 @@ Total tests under `tests/`: 1,720.
 | lane   | pass | fail | dropped |
 |--------|------|------|---------|
 | JS     | 872  | 3    | 845     |
-| Python | 789  | 5    | 926     |
+| Python | 794  | 5    | 921     |
 
 JS's own 3 fails and 845 drops are unrelated to this branch (present
 on `tests.ts`-style local runs before this work; not investigated
@@ -31,8 +31,8 @@ mismatch. The JS and C backends are unchanged in behaviour.
 
 ## Parity: the Python dropped count against JS's 845
 
-Python drops 926: JS's 845, plus 81 that drop only on Python. Every
-one of the 81 falls into one of two reasons, both legitimate under the
+Python drops 921: JS's 845, plus 76 that drop only on Python. Every
+one of the 76 falls into one of two reasons, both legitimate under the
 brief's exception clause ("a reason that exists only for JS"):
 
 **72 tests declare a test-local foreign effect**, an `import
@@ -73,16 +73,18 @@ reenter_channel`, `io_reenter_channel_done`, `io_reenter_closure`,
 `io_tcp_text_residue`, `io_u32_to_f32_host_zero`, `reg_closure_value_
 owns`, `reg_far_import`, `run_list_rebox_sum`.
 
-**9 tests need `Audio.*` or `Window.*`.** The `.c` twins
-(`effs/audio.c`, `effs/window.c`) need AppKit/QuartzCore, or ALSA and
-X11, linked in. This host has no `DISPLAY` (checked: empty), no
-`tkinter` (checked: not installed), and no Python Xlib or ALSA
-binding. A `.py` twin is not attempted: it would either stub out the
-whole surface (a fake fallback, against the brief's own rules) or need
-a library this host cannot exercise. Tests: `gfx_clicks`, `gfx_
-window`, `io_audio_frame_clock`, `io_audio_linux_progress`, `io_
-audio_monotonic_clock`, `io_audio_only_close`, `io_audio_only_open`,
-`io_audio_only_write`, `io_audio_whole_frames`.
+**4 more import a second, test-local foreign probe alongside
+`Audio.*`**: `audio_whole_frames` imports `pause` (its own `.js`),
+`audio_frame_clock` imports `AudioTest.clock`, `audio_linux_progress`
+imports `AudioTest.count`, `audio_monotonic_clock` imports `wall_
+clock_backwards`. Each probes something the comment in `audio_frame_
+clock.bend` names directly: "JS only: the native ring follows its
+device rather than this test clock." Same reason as the 72 above, not
+a missing `Audio.*` twin.
+
+**The other 5 of the original 9 `Audio.*`/`Window.*` tests now pass**,
+with the 8 JS-twin ports below: `audio_only_open`, `audio_only_close`,
+`audio_only_write`, `gfx_clicks`, `gfx_window`.
 
 ## Zero Python-only failures: not fully reached
 
@@ -137,20 +139,32 @@ Every other JS-passing test in the corpus passes on Python too.
   one) on a ~160-element list. Verified: `tests/base/
   u32_native_model.bend` compiles and passes.
 
-**b. 30 effects.** 26 ported with a `.py` twin matching the JS
-runtime's behaviour: `write`, `random_u32`, `thread_count`, `spawn`,
-`sleep`, `chan` (`new`/`send`/`recv`/`try_send`/`try_recv`/`close`,
-one file), `file_open`, `file_read`, `file_write`, `file_size`,
-`file_close`, `process_run`, `tcp_listen`, `tcp_accept`, `tcp_connect`,
-`tcp_send`, `tcp_recv`, `udp_bind`, `udp_send_to`, `udp_recv_from`,
-`socket_close`, `listener_close`. A full timed IO event loop (`io_
-wait`, `io_park_on`, `io_until`, `io_late`, `io_ready`, `select.
-select` for fd readiness) replaces the prior synchronous-only loop,
-mirroring the JS runtime's design, Python's `select` module standing
-in for the JS runtime's raw `select()` through `bun:ffi`. `audio_*`
-and `window_*` (4 effect files behind 9 tests) are not ported: see
-above. 0 of 30 silently dropped; the 9 blocked ones are named, with
-cause and evidence.
+**b. 30 effects, every one ported.** 22 as a direct, behaviour-
+matching port of the JS twin: `write`, `random_u32`, `thread_count`,
+`spawn`, `sleep`, `chan` (`new`/`send`/`recv`/`try_send`/`try_recv`/
+`close`, one file), `file_open`, `file_read`, `file_write`, `file_
+size`, `file_close`, `process_run`, `tcp_listen`, `tcp_accept`, `tcp_
+connect`, `tcp_send`, `tcp_recv`, `udp_bind`, `udp_send_to`, `udp_
+recv_from`, `socket_close`, `listener_close`. A full timed IO event
+loop (`io_wait`, `io_park_on`, `io_until`, `io_late`, `io_ready`,
+`select.select` for fd readiness) replaces the prior synchronous-only
+loop, mirroring the JS runtime's design, Python's `select` module
+standing in for the JS runtime's raw `select()` through `bun:ffi`.
+
+The other 8 (`audio_open`, `audio_write`, `audio_close`, `window_
+open`, `window_close`, `window_frame`, `window_grab`, `window_set_
+title`) port their JS twins exactly, not the native `.c` ones:
+`window_open` always fails with the same code (45 darwin, 95
+elsewhere) and the same "no display" message text; `window_close`/
+`frame`/`grab`/`set_title` are no-ops or pass the handle through, as
+the JS twins are; `audio_open` checks the 8000–192000 rate range and
+starts a silent clock; `audio_write` drains a 4096-frame ring by
+elapsed time with the same arithmetic, `time.monotonic()` in
+milliseconds standing in for `performance.now()`; `audio_close` is a
+no-op. 5 of the 9 tests that named only `Audio.*`/`Window.*` now pass,
+byte for byte with JS: `audio_only_open`, `audio_only_close`, `audio_
+only_write`, `gfx_clicks`, `gfx_window`. 0 of 30 effects left
+unattempted.
 
 **c. Module output.** `-o x.pym` emits a Python module: `py_lib(book,
 true)` mirrors `js_lib(book, true)`, rooting every public, non-base,
@@ -207,7 +221,8 @@ brief asks, since neither passes on JS at every size.
   a third, `FL.py`-gated branch.
 - `bend2/main.ts`: `-o x.py` calls `Comp.py_book`; `-o x.pym` calls
   `Comp.py_lib(book, true)`.
-- `bend2/effs/*.py`: 26 files, the effects listed under (b).
+- `bend2/effs/*.py`: 34 files (`chan.py` covers 6 of the 30 named
+  effects in one file), listed under (b).
 - `gates/test_py_local.ts`: the local two-lane runner.
 - `.scratch/stress/`: the stress-test programs and runner (gitignored,
   not part of the tests corpus).
