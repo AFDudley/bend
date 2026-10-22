@@ -3880,6 +3880,7 @@ import math
 import os
 import re
 import select
+import signal
 import socket as _socketlib
 import struct
 import sys
@@ -4310,12 +4311,38 @@ def io_exit(main, show):
         sys.exit(1)
 
 def io_out(fd, data):
-    f = sys.stdout.buffer if fd == 1 else sys.stderr.buffer
-    try:
-        f.write(data)
-        f.flush()
-    except BrokenPipeError:
-        sys.exit(1)
+    at = 0
+    end = len(data)
+    while at < end:
+        try:
+            n = os.write(fd, data[at:])
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            continue
+        except BrokenPipeError:
+            # _bend_run already restores SIGPIPE's kernel default on the
+            # main thread before this thread starts: write() normally
+            # dies by that signal directly, status 141 in a shell, the
+            # way yes | head does, before reaching this handler at all.
+            # This is the defensive fallback if it is reached anyway.
+            os.kill(os.getpid(), signal.SIGPIPE)
+            sys.exit(1)
+        except OSError:
+            try:
+                os.write(2, b"bend: a short write on a standard stream\n")
+            except OSError:
+                pass
+            sys.exit(1)
+        else:
+            # no progress would retry forever (#1445)
+            if n == 0:
+                try:
+                    os.write(2, b"bend: a short write on a standard stream\n")
+                except OSError:
+                    pass
+                sys.exit(1)
+            at += n
 
 def io_errs(message):
     io_out(2, io_bytes(message + "\n"))
@@ -4540,6 +4567,12 @@ def io_run(m):
         _io_active = parent
 
 def _bend_run():
+    # Python ignores SIGPIPE by default, turning it into a catchable
+    # BrokenPipeError; restoring the kernel default here, on the main
+    # thread before the IO thread starts, makes a write past a closed
+    # reader end the process by that signal, status 141 in a shell, the
+    # way yes | head does. signal.signal only works on the main thread.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     sys.setrecursionlimit(1000000)
     for mb in (512, 256, 64):
         try:
