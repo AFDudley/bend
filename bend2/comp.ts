@@ -3438,7 +3438,12 @@ const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
   },
   U32: OPTIMIZED.U32,
   F32: OPTIMIZED.F32,
-  Char: OPTIMIZED.Char,
+  // Char is a plain int in this runtime (see char_new/char_code above): a
+  // computed Char value passes through unwrapped, and its elim is the
+  // identity, since the matched value is already the code.
+  Char: {
+    Chr: { intr: ([c]) => view_of(c) ?? c, elim: ["$0"] },
+  },
   Array: {
     ALeaf: { intr: "[$0]", elim: ["$0[0]"], cond: "len($0) == 1" },
     ANode: {
@@ -3447,13 +3452,13 @@ const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
       cond: "len($0) != 1",
     },
   },
+  // String is a native Python str; SCon converts at the boundary where a
+  // Char (int) joins or leaves it, through char_new/char_code/char_len.
   String: {
     SNil: { intr: "\"\"", cond: "$0 == \"\"" },
     SCon: {
-      intr: ([h, t]) => STRLIT.test(h) && STRLIT.test(t)
-        ? JSON.stringify(JSON.parse(h) + JSON.parse(t))
-        : `(${h} + ${t})`,
-      elim: ["$0[:1]", "$0[1:]"],
+      intr: ([h, t]) => `(char_new(${h}) + ${t})`,
+      elim: ["char_code($0[:char_len($0)])", "$0[char_len($0):]"],
       cond: "$0 != \"\"",
     },
   },
@@ -3517,12 +3522,14 @@ function py_open(sc: Scope, x: Of<"Let">): HTerm {
     : py_var(sc, emit_hold(sc, [py_expr(sc, v)], x.k[j])[0])));
 }
 
-function py_num(v: number, f32: boolean): string {
-  if (!f32) {
-    return String(v);
-  }
+// A finite/zero/infinite F32 literal prints as plain Python source text;
+// a NaN literal instead calls f32_from_bits on its raw bits at Python
+// runtime, since Python source text (unlike the bits themselves) cannot
+// distinguish one NaN payload from another.
+function py_f32_bits(u: number): string {
+  const v = Bend.f32_from_bits(u);
   if (Number.isNaN(v)) {
-    return "float('nan')";
+    return `f32_from_bits(${u >>> 0})`;
   }
   if (v === Infinity) {
     return "float('inf')";
@@ -3567,10 +3574,17 @@ function py_expr(sc: Scope, tm: HTerm, ty0: HTerm | null = null): string {
     case "Ctr": {
       const [adt, u] = ctr_adt(x, ty);
       if (u !== null) {
-        const v = adt.k === "F32" ? Bend.f32_from_bits(u) : u;
-        return py_num(v, adt.k === "F32");
+        return adt.k === "F32" ? py_f32_bits(u) : String(u);
       }
-      const exprs = ctr_flds(x.k, x.x).map((f) => py_expr(sc, f));
+      // A field that is itself a dict-literal Ctr becomes its own prior
+      // statement (emit_alias), not a nested expression: a long List
+      // literal is one Con cell deep per field this way, not N deep,
+      // which keeps CPython's parser (unlike V8's) from overflowing on a
+      // long chain.
+      const exprs = ctr_flds(x.k, x.x).map((f) => {
+        const e = py_expr(sc, f);
+        return e.startsWith("{\"$\"") ? emit_alias(sc, e, "v") : e;
+      });
       const native = OPTIMIZED_PY[adt.k];
       if (native) {
         return tpl(native[x.k].intr, exprs);
@@ -3830,6 +3844,7 @@ import re
 import struct
 import sys
 import threading
+from fractions import Fraction
 
 # Native
 # ======
@@ -3933,12 +3948,55 @@ def f32_round_updown(f, x):
         return x
     return float(f(x))
 
+# f32_round rounds a decimal text to the nearest f32, exactly once, ties to
+# even: Python's own float(s) rounds to f64 first, which can round twice
+# (text to f64, f64 to f32) and land on the wrong side of an f32 boundary.
+# _f32_round_mag finds the f32 magnitude exactly, via Fraction, from a
+# nonzero, non-negative exact decimal value.
+def _f32_round_mag(exact):
+    def p2(k):
+        return Fraction(1 << k) if k >= 0 else Fraction(1, 1 << -k)
+    n, d = exact.numerator, exact.denominator
+    e = n.bit_length() - d.bit_length()
+    while p2(e) > exact:
+        e -= 1
+    while p2(e + 1) <= exact:
+        e += 1
+    if e < -126:
+        scale, exp_field = -149, 0
+    elif e > 127:
+        return math.inf
+    else:
+        scale, exp_field = e - 23, e + 127
+    target = exact / p2(scale)
+    m = target.numerator // target.denominator
+    frac = target - m
+    half = Fraction(1, 2)
+    if frac > half or (frac == half and m % 2 == 1):
+        m += 1
+    if m >= (1 << 24):
+        m >>= 1
+        exp_field += 1
+    if exp_field == 0 and m >= (1 << 23):
+        exp_field = 1
+    if exp_field >= 255:
+        return math.inf
+    bits = (exp_field << 23) | (m & 0x7FFFFF)
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
 def f32_round(s):
-    v = float(s)
-    try:
-        return struct.unpack("<f", struct.pack("<f", v))[0]
-    except OverflowError:
-        return math.inf if v > 0 else -math.inf
+    t = s.strip()
+    neg = t.startswith("-")
+    low = t.lower().lstrip("+-")
+    if low in ("inf", "infinity"):
+        return -math.inf if neg else math.inf
+    if low == "nan":
+        return math.nan
+    exact = Fraction(t)
+    if exact == 0:
+        return -0.0 if neg else 0.0
+    mag = _f32_round_mag(abs(exact))
+    return -mag if exact < 0 else mag
 
 # JS's Number::toString: given an exact significant-digit string and its
 # decimal exponent (both known exactly from Python's own "%e" formatting,
@@ -4023,20 +4081,52 @@ def word_to_u32(w):
         w = w["tail"]
     return x & 0xFFFFFFFF
 
+# A Char is a plain Python int everywhere in this runtime: the full 21-bit
+# word round-trips, with no cap at Python's chr() limit (0x10FFFF). String
+# stays a native Python str, so char_new/char_code/char_len convert only at
+# the boundary where a Char joins or leaves a String: in range, one Python
+# character; past 0x10FFFF, the same 4-unit sentinel packing the JS runtime
+# uses (Python str, like JS's, accepts a lone surrogate unit).
 def char_new(c):
-    return chr(c)
+    if c < 0xD800 or (0xE000 <= c <= 0x10FFFF):
+        return chr(c)
+    return chr(0xDC00) + chr((c >> 22) & 0x7FF) + chr((c >> 11) & 0x7FF) + chr(c & 0x7FF)
 
 def char_code(s):
-    return ord(s)
+    if len(s) < 4:
+        return ord(s)
+    return (ord(s[1]) << 22 | ord(s[2]) << 11 | ord(s[3])) & 0xFFFFFFFF
+
+def char_len(s, at=0):
+    return 4 if s[at] == "\udc00" else 1
+
+def string_chars(s):
+    at = 0
+    n = len(s)
+    while at < n:
+        ln = char_len(s, at)
+        yield char_code(s[at:at + ln])
+        at += ln
 
 def string_contains(s, p):
-    return p in s
+    at = 0
+    n = len(s)
+    while True:
+        if s.startswith(p, at):
+            return True
+        if at >= n:
+            return False
+        at += char_len(s, at)
 
+# The output boundary: a packed out-of-range Char becomes U+FFFD, the way
+# the JS runtime's str_out does for its own UTF-16 packing.
 def str_out(s):
-    return s
+    return re.sub("\udc00[\\s\\S]{3}", "\ufffd", s)
 
+# The input boundary: external text may hold a lone surrogate (invalid
+# UTF-8 decoded with surrogateescape); str_in replaces it with U+FFFD.
 def str_in(s):
-    return s
+    return re.sub("[\ud800-\udfff]", "\ufffd", s)
 
 # Array
 # =====
@@ -4114,16 +4204,16 @@ def cli(argv):
 # Show
 # ====
 
-def show_chr(s, q):
-    c = char_code(s)
+def show_chr(c, q):
     special = {10: "n", 9: "t", 13: "r", 0: "0", 92: "\\"}
     if c in special:
         return "\\" + special[c]
-    if s == q:
+    packed = not (c < 0xD800 or (0xE000 <= c <= 0x10FFFF))
+    if not packed and chr(c) == q:
         return "\\" + q
-    if c < 32 or c == 127:
+    if c < 32 or c == 127 or packed:
         return "\\u{%x}" % c
-    return s
+    return chr(c)
 
 def show_val(D, d, v, chain):
     k = D[d]
@@ -4158,7 +4248,7 @@ def show_val(D, d, v, chain):
     if k == 3:
         return "'" + show_chr(v, "'") + "'"
     if k == 4:
-        return '"' + "".join(show_chr(c, '"') for c in v) + '"'
+        return '"' + "".join(show_chr(c, '"') for c in string_chars(v)) + '"'
     if k == 5:
         return "{==}"
     return "[" + ", ".join(show_val(D, D[d + 1], x, 0) for x in v) + "]"
