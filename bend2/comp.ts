@@ -4427,6 +4427,33 @@ def io_park_on(fd, out, k, more, at):
             i = j
     ws.insert(i + 1, {"fd": fd, "out": out, "k": k, "more": more, "at": at})
 
+# select.select's fd_set cannot hold a descriptor at or past FD_SETSIZE
+# (1024 on this host); select.poll has no such limit, so a wait past it
+# falls back to poll instead of raising. poll's own FIFO-close report is
+# unreliable on macOS (the JS runtime's own reason to prefer select for
+# the common case); the fallback accepts that known gap only for the
+# rare fd past FD_SETSIZE, not for an ordinary wait.
+def io_poll_ready(rfds, wfds, timeout):
+    try:
+        ready_r_l, ready_w_l, _ = select.select(rfds, wfds, [], timeout)
+        return set(ready_r_l), set(ready_w_l)
+    except ValueError:
+        poller = select.poll()
+        masks = {}
+        for fd in rfds:
+            masks[fd] = masks.get(fd, 0) | select.POLLIN
+        for fd in wfds:
+            masks[fd] = masks.get(fd, 0) | select.POLLOUT
+        for fd, mask in masks.items():
+            poller.register(fd, mask)
+        ms = None if timeout is None else max(0, round(timeout * 1000))
+        events = poller.poll(ms)
+        ready_r = {fd for fd, ev in events
+            if ev & (select.POLLIN | select.POLLHUP | select.POLLERR)}
+        ready_w = {fd for fd, ev in events
+            if ev & (select.POLLOUT | select.POLLHUP | select.POLLERR)}
+        return ready_r, ready_w
+
 def io_wait(io, block):
     soon = io["waits"][0]["at"] if io["waits"] else None
     if not block:
@@ -4439,8 +4466,7 @@ def io_wait(io, block):
     wfds = [w["fd"] for w in io["waits"] if w["fd"] is not None and w["out"]]
     ready_r, ready_w = set(), set()
     if rfds or wfds:
-        ready_r_l, ready_w_l, _ = select.select(rfds, wfds, [], timeout)
-        ready_r, ready_w = set(ready_r_l), set(ready_w_l)
+        ready_r, ready_w = io_poll_ready(rfds, wfds, timeout)
     elif timeout:
         time.sleep(timeout)
     now = time.monotonic() * 1000
