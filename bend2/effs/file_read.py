@@ -4,8 +4,8 @@
 def file_read_with(file, max_n, offset, pack):
     length = min(int(max_n), 2147483647)
     try:
-        b = os.pread(file, max(length, 1), offset) if offset is not None \
-            else os.read(file, max(length, 1))
+        b = os.pread(file, length, offset) if offset is not None \
+            else os.read(file, length)
         return io_tup(file, io_done(pack(b, len(b))))
     except OSError as e:
         return io_tup(file, io_fail(abs(e.errno)))
