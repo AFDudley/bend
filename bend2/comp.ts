@@ -4281,12 +4281,22 @@ def run_tail(f, x):
     j = getattr(f, "j", None)
     return (j, x) if j is not None and getattr(j, "f", None) is f else (f, x)
 
+# A __slots__ instance, not a nested function + two setattr calls: the
+# slot attribute access CPython uses for self.j is cheaper than the
+# dict-backed attribute CPython gives a plain function object (#1122
+# measurement, io_chan_reclaim_limit's 1M-churn-level slice, alone:
+# 2.73 s to 2.32 s, 15%, interleaved against the prior function form to
+# cancel host load drift).
+class _Clo:
+    __slots__ = ("j",)
+    def __init__(self, j):
+        self.j = j
+        j.f = self
+    def __call__(self, x):
+        return run_loop(self.j(x))
+
 def run_clo(j):
-    def f(x):
-        return run_loop(j(x))
-    f.j = j
-    j.f = f
-    return f
+    return _Clo(j)
 
 def run_loop(r):
     while type(r) is tuple:
