@@ -3509,10 +3509,19 @@ const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
   },
   // String is a native Python str; SCon converts at the boundary where a
   // Char (int) joins or leaves it, through char_new/char_code/char_len.
+  // A literal Char field compiles to its bare codepoint (see Char.Chr
+  // above), so a chain of literal SCon fields folds to one Python
+  // string literal at compile time here, the same way JS's own SCon.intr
+  // folds a STRLIT chain; without this fold, chunk()'s 64-char literal
+  // in tests/io/tcp_send_slow_peer.bend rebuilt itself through 64 nested
+  // char_new calls on every one of its 1024 loop turns (#1122 profile:
+  // 173M char_new calls, 19.1 s of __chunk's 36.5 s under cProfile).
   String: {
     SNil: { intr: "\"\"", cond: "$0 == \"\"" },
     SCon: {
-      intr: ([h, t]) => `(char_new(${h}) + ${t})`,
+      intr: ([h, t]) => /^\d+$/.test(h) && STRLIT.test(t)
+        ? JSON.stringify(char_new(+h) + JSON.parse(t))
+        : `(char_new(${h}) + ${t})`,
       elim: ["char_code($0[:char_len($0)])", "$0[char_len($0):]"],
       cond: "$0 != \"\"",
     },
