@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 name = "bend2-toolchain"
 # <upstream version>+pytarget.<bend2/ source commit>; build.sh checks that the
 # commit here matches the commit it archives.
-version = "2.0.38+pytarget.a41b45a67"
+version = "2.0.38+pytarget.cefaf5450"
 description = "Bend2 compiler with the Python target, bun, and a prebuilt BendTT kernel"
 license = "Apache-2.0"
 requires-python = ">=3.10"
