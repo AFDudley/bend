@@ -3952,14 +3952,31 @@ import errno
 import math
 import os
 import re
-import select
-import signal
-import socket as _socketlib
 import struct
 import sys
-import threading
 import time
 from fractions import Fraction
+import importlib
+
+# select, signal, socket and threading load on first use, the way the JS
+# runtime requires fs and bun:ffi inside its IO functions: a program that
+# does no IO loads none of them. The names stay globals because effect files
+# (effs/*.py and a program's own .py twins) call them as select.select,
+# signal.signal, _socketlib.socket and threading.Thread.
+class _LazyModule:
+    def __init__(self, name):
+        self._name = name
+        self._mod = None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+select = _LazyModule("select")
+signal = _LazyModule("signal")
+_socketlib = _LazyModule("socket")
+threading = _LazyModule("threading")
 
 # Native
 # ======
