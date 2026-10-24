@@ -14,7 +14,9 @@ from typing import Any
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 PLATFORM_TAG = "py3-none-manylinux_2_36_x86_64"
-REQUIRED = ("bun", "bendtt", "COMMIT", "LEAN_VERSION", "BUN_VERSION", "bend2/main.ts")
+REQUIRED = (
+    "bun", "bendtt", "COMMIT", "LEAN_VERSION", "BUN_VERSION", "bend2/main.ts", "guide/GUIDE.md",
+)
 
 
 class CustomBuildHook(BuildHookInterface):

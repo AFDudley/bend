@@ -20,7 +20,7 @@ repo=$(git -C "$here" rev-parse --show-toplevel)
 data="$here/src/bend2_toolchain/_data"
 
 full=$(git -C "$repo" rev-parse "$BEND_COMMIT^{commit}")
-grep -q "pytarget.$BEND_COMMIT\"" "$here/pyproject.toml" \
+grep -qE "pytarget\.$BEND_COMMIT(\.[0-9a-z]+)?\"" "$here/pyproject.toml" \
   || { echo "pyproject.toml version does not name $BEND_COMMIT" >&2; exit 1; }
 src_lean=$(git -C "$repo" show "$full:bend2/safe.ts" | sed -n 's/^const LEAN_VERSION = "\(.*\)";$/\1/p')
 [ "$src_lean" = "$LEAN_VERSION" ] \
@@ -28,7 +28,9 @@ src_lean=$(git -C "$repo" show "$full:bend2/safe.ts" | sed -n 's/^const LEAN_VER
 
 rm -rf "$data" "$here/dist"
 mkdir -p "$data"
-git -C "$repo" archive "$full" bend2 | tar -x -C "$data"
+# bend2/ is the compiler; guide/ is what `bend guide` prints (main.ts reads
+# BEND_DIR/../guide).
+git -C "$repo" archive "$full" bend2 guide | tar -x -C "$data"
 echo "$full" > "$data/COMMIT"
 echo "$LEAN_VERSION" > "$data/LEAN_VERSION"
 echo "$BUN_VERSION" > "$data/BUN_VERSION"
