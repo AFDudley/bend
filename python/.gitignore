@@ -1,3 +1,4 @@
 # build.sh output
 src/bend2_toolchain/_data/
 dist/
+__pycache__/
