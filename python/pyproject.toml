@@ -1,0 +1,24 @@
+# bend2-toolchain: the Bend2 compiler (with the Python target), bun, and a
+# prebuilt BendTT kernel, as one platform wheel. See python/README.md.
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bend2-toolchain"
+# <upstream version>+pytarget.<bend2/ source commit>; build.sh checks that the
+# commit here matches the commit it archives.
+version = "2.0.38+pytarget.a41b45a67"
+description = "Bend2 compiler with the Python target, bun, and a prebuilt BendTT kernel"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+
+[project.scripts]
+bend = "bend2_toolchain.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bend2_toolchain"]
+artifacts = ["src/bend2_toolchain/_data/**"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
