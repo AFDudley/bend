@@ -10,7 +10,7 @@
 # platform tag names. Output: python/dist/bend2_toolchain-*.whl.
 set -eu
 
-BEND_COMMIT=cefaf5450
+BEND_COMMIT=3983d7c6b
 BUN_VERSION=1.4.2
 LEAN_VERSION=4.34.0
 IMAGE=debian:bookworm-slim
