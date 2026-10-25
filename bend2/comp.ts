@@ -544,6 +544,21 @@ function cid_mac(k: string): string {
   return name_id("CID_", k);
 }
 
+// A py_lib export name. name_clean(k) alone has two defects: a hash
+// import's own qualified book key (e.g. "0xcd4682.../nat.add_zero") stays
+// digit-led, which Python's grammar refuses as a def name; and two
+// distinct keys ("a.b" and "a_b") both clean to the same spelling. Both
+// defects are already solved, for every OTHER name this file mints, by
+// name_id's own dedup against the shared FL.taken set -- prefixing a bare
+// leading digit with "_" before that dedup runs settles the first, and
+// the pre-populated py_reserved() names in FL.taken (file_new) keep an
+// export from landing on a RUNTIME_PY import, def, class or global. Every
+// export that needs neither guard keeps the plain name_clean(k) spelling
+// it had before.
+function py_export_name(k: Name): string {
+  return name_id(/^[0-9]/.test(name_clean(k)) ? "_" : "", k);
+}
+
 // Char
 // ====
 
@@ -1375,6 +1390,7 @@ function file_new(book: Bend.Book, js: boolean, py = false) {
     py,
     bangs: new Set<Name>(),
     sites: new Map<Name, number>(),
+
     srcs: new Map<Name, Set<Name> | null>(),
     loops: new Map<Name, Name[]>(),
     flats: new Map<Name, boolean>(),
@@ -1384,7 +1400,10 @@ function file_new(book: Bend.Book, js: boolean, py = false) {
     teles: new Map<HTerm, { doms: Dom[]; ret: HTerm }>(),
     keys: new WeakMap<HTerm, string>(),
     ids: new Map<string, string>(),
-    taken: new Set("FID_EXIT FID_ENTER FID_T CID_T $pc".split(" ")),
+    taken: new Set([
+      ...("FID_EXIT FID_ENTER FID_T CID_T $pc".split(" ")),
+      ...(py ? py_reserved() : []),
+    ]),
     locals: new Map<string, Name>(),
     names: new Map<number, string>(),
     facts: new Set<string>(),
@@ -3916,7 +3935,7 @@ export function py_lib(book: Bend.Book, mod = false): string {
     const xs = live.map(([, , A], i) => py_host(A, ps[i]));
     const call = `run_loop(${name_id("__", k)}(${xs.join(", ")}))`;
     const ret = py_host(tele_unbind(FL.book.tlds[k].T).ret, call, 1);
-    return `def ${name_clean(k)}(${ps.join(", ")}):\n    return ${ret}\n`;
+    return `def ${py_export_name(k)}(${ps.join(", ")}):\n    return ${ret}\n`;
   }).join("\n");
   const jmps = new Map<Name, boolean>();
   const jmp = (k: Name): boolean => k === CLO_APPLY || memo(jmps, k, () =>
@@ -4702,6 +4721,25 @@ def _bend_run():
     sys.exit(code[0])
 
 `.slice(1);
+
+// The top-level names RUNTIME_PY binds: every import, def, class and
+// module-level assignment, derived from its own text once. A py_lib
+// export must never land on one of these -- the export defs are appended
+// AFTER this runtime text, in the same module, so a reused name would
+// silently redefine (shadow) the runtime function, class or import it
+// names, not merely look alike.
+let PY_RESERVED: Set<string> | null = null;
+function py_reserved(): Set<string> {
+  if (PY_RESERVED === null) {
+    PY_RESERVED = new Set<string>();
+    for (const m of RUNTIME_PY.matchAll(
+      /^(?:import (\w+)|from \S+ import (\w+)|def (\w+)|class (\w+)|(\w+)\s*=)/gm,
+    )) {
+      PY_RESERVED.add((m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5])!);
+    }
+  }
+  return PY_RESERVED;
+}
 
 // RuntimeC
 // ========
