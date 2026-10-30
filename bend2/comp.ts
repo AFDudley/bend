@@ -68,7 +68,14 @@ type Scope = {
 
 type Spare = { words: number; name: string; taken: boolean };
 
-type Native = Record<Name, { intr: string; elim?: string[]; cond?: string }>;
+// A string template fills $0, $1, ... positionally; a function template
+// builds its result from the arg list directly, for an intrinsic a plain
+// substitution can't express (py_lib's String.SCon folds a literal char
+// chain into one Python string literal at compile time, not N nested
+// char_new calls).
+type Tpl = string | ((xs: string[]) => string);
+
+type Native = Record<Name, { intr: Tpl; elim?: string[]; cond?: string }>;
 
 type Of<K> = Extract<HTerm, { $: K }>;
 
@@ -572,8 +579,8 @@ function char_new(c: number): string {
 // Tpl
 // ===
 
-function tpl(t: string, xs: string[]): string {
-  return t.replace(/\$(\d)/g, (_, i) => xs[i]);
+function tpl(t: Tpl, xs: string[]): string {
+  return typeof t !== "string" ? t(xs) : t.replace(/\$(\d)/g, (_, i) => xs[i]);
 }
 
 function nat_peel(t: HTerm, step = (s: HTerm) => s): [HTerm | null, number] {
@@ -3148,7 +3155,7 @@ function js_word(k: Name, u: number): string {
 }
 
 function py_word(k: Name, u: number): string {
-  return k === "F32" ? py_num(Bend.f32_from_bits(u), true) : String(u);
+  return k === "F32" ? py_f32_bits(u) : String(u);
 }
 
 function js_key(n: Name): string {
@@ -3399,6 +3406,21 @@ export function js_book(book: Bend.Book): string {
 // Py
 // --
 
+// ATOM/STRLIT mark a PY expression py_call's own exprs.map can pass
+// straight into a template (a bare name, number or string literal needs
+// no hold first, the way a compound expression does). VIEW/view_of mark
+// the field a Python match opens from a named U32, F32 or Char: a binder
+// takes it as written, so a rebuild folds back to the name instead of
+// re-wrapping it.
+const ATOM = /^(?:[A-Za-z_][A-Za-z0-9_]*|\d+|\d+\.\d+)$/;
+const STRLIT = /^"(?:[^"\\]|\\.)*"$/;
+const VIEW = /^(?:u32_to_word\((\w+|f32_bits\((\w+)\))\)|char_code\((\w+)\))$/;
+
+function view_of(e: string): string | undefined {
+  const m = e.match(VIEW);
+  return m?.[1] ?? m?.[3];
+}
+
 // PY operation templates, added beside the JS ones in OPERATIONS. U32 masks
 // with & 0xFFFFFFFF, as Python ints have no fixed width. F32 rounds through
 // struct.pack (f32_rewrap, in RUNTIME_PY); a handful of math functions wrap
@@ -3502,10 +3524,10 @@ for (const [k, py] of Object.entries({
 
 // Per native constructor, as OPTIMIZED but for Python text: a dict with a
 // quoted "$" key, len()/slicing instead of .length/.slice, True/False/not.
-// Nat, U32, F32 and Char already read as Python, so those four are shared.
+// U32, F32 and Char already read as Python, so those three are shared; Nat
+// takes py_expr's own nat_peel path, the same one js_expr takes.
 
 const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
-  Nat: OPTIMIZED.Nat,
   Bool: {
     False: { intr: "False", cond: "not $0" },
     True: { intr: "True", cond: "$0" },
@@ -3558,6 +3580,13 @@ const OPTIMIZED_PY: Record<Name, Native> = Object.setPrototypeOf({
 // $-prefixed JS names (Python has no $) become "__"-prefixed globals and
 // plain v0, v1, pc, t locals; name_local's own "_base_n" names can never
 // collide with either, since they always start with exactly one "_".
+
+// A native Python closure captures by lexical scope, not an explicit
+// param list the way js_expr's wrapper functions do: py_var records the
+// nesting depth a Var was probed at, so py_expr's Lam/Mat/Efq case can
+// tell a name bound outside the closure (needs a capture) from one bound
+// inside it (needs none).
+const JS_DEPTH = new WeakMap<HTerm, number>();
 
 function py_var(sc: Scope, k: string): HTerm {
   if (k === "None") {
@@ -3659,6 +3688,11 @@ function py_expr(sc: Scope, tm: HTerm, ty0: HTerm | null = null): string {
       if (u !== null) {
         return adt.k === "F32" ? py_f32_bits(u) : String(u);
       }
+      if (adt.k === "Nat") {
+        const [b, n] = nat_peel(x);
+        return b === null ? String(n)
+          : `nat_chk(${py_expr(sc, b, adt)} + ${n})`;
+      }
       // A field that is itself a dict-literal Ctr becomes its own prior
       // statement (emit_alias), not a nested expression: a long List
       // literal is one Con cell deep per field this way, not N deep,
@@ -3692,8 +3726,8 @@ function py_expr(sc: Scope, tm: HTerm, ty0: HTerm | null = null): string {
       const vs = new Map<HTerm, string>();
       const cl = { ...sc, seg: seg_new("", BOX, []),
         caps: { d: (sc.caps?.d ?? 0) + 1, vs } };
-      FL.spins.push(cl.seg);
-      const name = name_id("__", sc.def + "__c" + FL.spins.length);
+      FL.unit!.segs.push(cl.seg);
+      const name = name_id("__", seg_name("c"));
       py_func(cl, x, ty, [arg]);
       const ps = [...new Set(vs.values())];
       vs.forEach((_, p) => py_expr(sc, p));
@@ -3810,13 +3844,14 @@ function py_host(A: HTerm | null, x: string, out = 0): string {
     : k === "F32" && !out ? `f32_rewrap(${x})` : x;
 }
 
-function py_def(sc: Scope, k: Name, def: Bend.Def): void {
+function py_def(k: Name, def: Bend.Def): void {
   if (intr_of(k, true)) {
     return;
   }
-  FUEL = FOLD_FUEL;
-  sc = { ...sc, fresh: new Map(), def: k };
+  const sc = scope_new();
   sc.seg.def = k;
+  sc.def = k;
+  FL.unit!.segs.push(sc.seg);
   const { live, h } = fun_of(k);
   const loop = loop_of(k);
   // A call site passes only as many arguments as its own term needs; the
@@ -3848,9 +3883,7 @@ function py_def(sc: Scope, k: Name, def: Bend.Def): void {
     }
     block(sc, "while True {", () =>
       loop.forEach((d, i) => {
-        memo_gc();
-        FUEL = FOLD_FUEL;
-        const fx = { ...sc, fresh: new Map(), def: d };
+        const fx = { ...sc, fresh: new Map(), def: d, fuel: { n: FOLD_FUEL } };
         const ps = fun_of(d).live.map(([, x]) => name_local(fx, x));
         block(fx, pc ? `${i === 0 ? "if" : "elif"} pc == ${i} {` : "if True {",
           () => {
@@ -3868,7 +3901,11 @@ function py_def(sc: Scope, k: Name, def: Bend.Def): void {
 // gets a "pass", since Python has no empty block.
 function py_text(lines: string[], tab: number): string[] {
   const rows: [number, string][] = [];
-  for (const raw of lines) {
+  for (const line of lines) {
+    // file_push bakes in a C/JS brace-depth indent (sc.seg.tab) that
+    // mismatches Python's own, elif-collapsing depth count below: strip
+    // it first and let the marker pair alone drive this pass's depth.
+    const raw = line.replace(/^ +/, "");
     const close = raw.startsWith("}");
     if (close) {
       tab -= 1;
@@ -3895,11 +3932,6 @@ function py_text(lines: string[], tab: number): string[] {
   return out;
 }
 
-function py_show_json(show: (number | Name)[] | null): string {
-  return show === null ? "None" : JSON.stringify(show.map((c) =>
-    typeof c === "string" ? [js_tag(c), Bend.name_key(c)] : c));
-}
-
 // A module (for -o <out>.pyl, mirroring js_lib(book, true)'s -o <out>.mjs)
 // roots and exports each callable def by its book name, sanitized to a
 // valid Python identifier (a dot becomes an underscore): "import t" then
@@ -3913,10 +3945,8 @@ export function py_lib(book: Bend.Book, mod = false): string {
       && io_base(FL.book, t.T) === null;
   });
   file_book(outs ?? ["main"]);
-  const sc = scope_new();
   for (const [k, def] of done_defs(fun_runs)) {
-    memo_gc();
-    py_def(sc, k, def);
+    unit_emit(unit_new(k, () => py_def(k, def)));
   }
   // Each effect source keeps its own scope, the way a JS IIFE does: two
   // files may define the same local name (effect_helper_collision's two
@@ -3940,19 +3970,18 @@ export function py_lib(book: Bend.Book, mod = false): string {
   const jmps = new Map<Name, boolean>();
   const jmp = (k: Name): boolean => k === CLO_APPLY || memo(jmps, k, () =>
     (jmps.set(k, true), [...FL.tails.get(k) ?? []].some(jmp)));
-  const funs = [sc.seg, ...FL.spins].flatMap((f) => py_text(f.lines, 0))
-    .join("\n").replace(/\x01([^\x02]*)\x02/g, (_, k) => jmp(k) ? "run_loop"
-      : "");
+  const funs = [...FL.units.values()].flatMap((u) =>
+    u.segs.flatMap((f) => py_text(f.lines, 0))).join("\n")
+    .replace(/\x01([^\x02]*)\x02/g, (_, k) => jmp(k) ? "run_loop" : "");
   PROBES.length = 1;
   return RUNTIME_PY + effs + "# Program\n# =======\n\n" + [funs, ...[...FL.tabs]
     .map(([r, i]) => `TAB_${i} = [${r}]`)].join("\n") + lib;
 }
 
 export function py_book(book: Bend.Book): string {
-  const lib = py_lib(book);
-  const show = show_main();
+  const lib = py_lib(main_pure(book, true));
   return `${lib}\ndef _bend_main():\n    cli(sys.argv)\n    io_exit(${
-    name_id("__", "main")}, ${py_show_json(show)})\n\n\n_bend_run()\n`;
+    name_id("__", "main")})\n\n\n_bend_run()\n`;
 }
 
 // RuntimePy
@@ -4370,66 +4399,11 @@ def cli(argv):
             cli_args.append(a)
         i += 1
 
-# Show
-# ====
-
-def show_chr(c, q):
-    special = {10: "n", 9: "t", 13: "r", 0: "0", 92: "\\"}
-    if c in special:
-        return "\\" + special[c]
-    packed = not (c < 0xD800 or (0xE000 <= c <= 0x10FFFF))
-    if not packed and chr(c) == q:
-        return "\\" + q
-    if c < 32 or c == 127 or packed:
-        return "\\u{%x}" % c
-    return chr(c)
-
-def show_val(D, d, v, chain):
-    k = D[d]
-    if k == 7:
-        fs = list({"$": "True" if v else "False"}.values()) \
-            if isinstance(v, bool) else list(v.values())
-        a = d + 3
-        while D[a + 1][0] != fs[0]:
-            a += 4 + 2 * D[a + 2]
-        o = "{[("[D[a + 3]]
-        if o == "{":
-            s = D[a + 1][1] + "{"
-        elif chain == o:
-            s = ""
-        else:
-            s = o
-        for j, f in enumerate(fs[1:]):
-            cond = (j == 0 and chain == o) if o == "[" else (j > 0)
-            if cond:
-                s += ", "
-            s += show_val(D, D[a + 5 + 2 * j], f,
-                (o if (j == 1 and o != "{") else 0))
-        if o == "{" or chain != o:
-            return s + "}])"[D[a + 3]]
-        return s
-    if k == 0:
-        return str(v)
-    if k == 1:
-        return re.sub(r"^-?\d+(?=e|$)", lambda m: m.group(0) + ".0", f32_show(v))
-    if k == 2:
-        return str(v) + "n"
-    if k == 3:
-        return "'" + show_chr(v, "'") + "'"
-    if k == 4:
-        return '"' + "".join(show_chr(c, '"') for c in string_chars(v)) + '"'
-    if k == 5:
-        return "{==}"
-    return "[" + ", ".join(show_val(D, D[d + 1], x, 0) for x in v) + "]"
-
 # Io
 # ==
 
-def io_exit(main, show):
+def io_exit(main):
     try:
-        if show is not None:
-            io_out(1, io_bytes(show_val(show, 0, run_loop(main()), 0) + "\n"))
-            sys.exit(0)
         sys.exit(io_run(main))
     except SystemExit:
         raise
