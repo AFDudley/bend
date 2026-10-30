@@ -33,6 +33,30 @@ def _process_read(proc, max_n, deadline):
     return bytes(outs[proc.stdout.fileno()]), bytes(outs[proc.stderr.fileno()]), \
         False, over
 
+# Writes the whole input on its own thread, concurrently with
+# _process_read's reads: a one-shot blocking write of a large input can
+# otherwise fill the pipe and block before a reader that attaches late
+# (a backgrounded "sleep 0.2; cat <&0 &") ever starts draining it.
+# _bend_run restores SIGPIPE's kernel default (process-wide) so the main
+# thread's own stdout write dies by the signal, shell-style; that same
+# default would also kill this write past a reader that already closed
+# its end or exited. signal.signal only runs on the main thread, and
+# this runs on its own; blocking SIGPIPE's delivery to this thread
+# alone, for this write only, lets a closed pipe raise BrokenPipeError
+# (an ordinary result here) instead -- unblocking a still-pending
+# SIGPIPE delivers it right there, so sigtimedwait first drains one if
+# the write raised it.
+def _feed_stdin(proc, data):
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGPIPE})
+    try:
+        proc.stdin.write(data)
+        proc.stdin.close()
+    except OSError:
+        pass
+    finally:
+        signal.sigtimedwait({signal.SIGPIPE}, 0)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGPIPE})
+
 def process_run(program, args, input_text, max_output, timeout_ms, k):
     argv = [str_out(program)]
     xs = args
@@ -53,24 +77,9 @@ def process_run(program, args, input_text, max_output, timeout_ms, k):
     except OSError as e:
         return io_fail(abs(e.errno) if e.errno else 5)
     deadline = time.monotonic() + ms / 1000
-    # _bend_run restores SIGPIPE's kernel default (process-wide) so the
-    # main process's own stdout write dies by the signal, shell-style;
-    # that same default would also kill this IO-thread process on a
-    # write to the child's stdin past a child that already closed it or
-    # exited. signal.signal only runs on the main thread; blocking
-    # SIGPIPE's delivery to this thread alone, for this write only, lets
-    # a closed pipe raise BrokenPipeError here instead -- unblocking a
-    # still-pending SIGPIPE delivers it right there, so sigtimedwait
-    # first drains one if the write raised it.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGPIPE})
-    try:
-        proc.stdin.write(io_bytes(input_text))
-        proc.stdin.close()
-    except OSError:
-        pass
-    finally:
-        signal.sigtimedwait({signal.SIGPIPE}, 0)
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGPIPE})
+    writer = threading.Thread(target=_feed_stdin,
+        args=(proc, io_bytes(input_text)), daemon=True)
+    writer.start()
     out_b, err_b, timed_out, over = _process_read(proc, max_n, deadline)
     if timed_out:
         proc.kill()
