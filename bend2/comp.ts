@@ -3789,8 +3789,9 @@ function py_match(sc: Scope, x: HTerm, ty: HTerm | null, args: string[]): void {
   if (x.$ === "Efq") {
     return file_push(sc, `raise Exception(${JSON.stringify("bend: " + ERRS[2])});`);
   }
-  const { adt, ret, rows, cells } = mat_rows(sc, x, ty);
   const s = emit_alias(sc, args[0], "t");
+  const self = probe(s);
+  const { adt, ret, rows, cells } = mat_rows(sc, x, ty, self);
   const tab = emit_tab(sc, cells, ret, s);
   if (tab !== null) {
     return file_push(sc, `return ${tab};`);
