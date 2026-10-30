@@ -1,8 +1,10 @@
 # File
 # ====
 
-_FILE_MODE = {"r": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-    "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND}
+_FILE_MODE = {"r": os.O_RDONLY, "r+": os.O_RDWR,
+    "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+    "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+    "x": os.O_WRONLY | os.O_CREAT | os.O_EXCL}
 
 # name is the path's bytes, or None if a value is past 255.
 def file_open_with(name, mode):

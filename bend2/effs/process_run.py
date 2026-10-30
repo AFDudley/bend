@@ -43,17 +43,34 @@ def process_run(program, args, input_text, max_output, timeout_ms, k):
     ms = int(timeout_ms)
     if max_n == 0 or ms == 0 or any("\0" in a for a in argv):
         return io_fail(22)
+    if argv[0] == "":
+        # Popen([""]) raises EACCES, not the ENOENT posix_spawnp("")
+        # answers in C and the JS lane's own spawn("") special case.
+        return io_fail(2)
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
     except OSError as e:
         return io_fail(abs(e.errno) if e.errno else 5)
     deadline = time.monotonic() + ms / 1000
+    # _bend_run restores SIGPIPE's kernel default (process-wide) so the
+    # main process's own stdout write dies by the signal, shell-style;
+    # that same default would also kill this IO-thread process on a
+    # write to the child's stdin past a child that already closed it or
+    # exited. signal.signal only runs on the main thread; blocking
+    # SIGPIPE's delivery to this thread alone, for this write only, lets
+    # a closed pipe raise BrokenPipeError here instead -- unblocking a
+    # still-pending SIGPIPE delivers it right there, so sigtimedwait
+    # first drains one if the write raised it.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGPIPE})
     try:
         proc.stdin.write(io_bytes(input_text))
         proc.stdin.close()
     except OSError:
         pass
+    finally:
+        signal.sigtimedwait({signal.SIGPIPE}, 0)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGPIPE})
     out_b, err_b, timed_out, over = _process_read(proc, max_n, deadline)
     if timed_out:
         proc.kill()

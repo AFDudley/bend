@@ -3453,6 +3453,7 @@ for (const [k, py] of Object.entries({
   u32_to_f32: "f32_rewrap($0)",
   u32_to_nat: "$0",
   u32_from_nat: "($0 & 0xFFFFFFFF)",
+  f32_from_nat: "f32_rewrap($0)",
   f32_add: "f32_rewrap($0 + $1)",
   f32_sub: "f32_rewrap($0 - $1)",
   f32_mul: "f32_rewrap($0 * $1)",
@@ -3790,7 +3791,12 @@ function py_match(sc: Scope, x: HTerm, ty: HTerm | null, args: string[]): void {
     return file_push(sc, `raise Exception(${JSON.stringify("bend: " + ERRS[2])});`);
   }
   const s = emit_alias(sc, args[0], "t");
+  // arm_self (via mat_rows) may substitute this probe for the matched
+  // constructor in a self-referencing arm; py_var's JS_DEPTH bookkeeping
+  // applies to it exactly as it would to any other bound var, so a
+  // closure over the arm still finds it at this depth.
   const self = probe(s);
+  JS_DEPTH.set(self, sc.caps?.d ?? 0);
   const { adt, ret, rows, cells } = mat_rows(sc, x, ty, self);
   const tab = emit_tab(sc, cells, ret, s);
   if (tab !== null) {
