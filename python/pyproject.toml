@@ -9,7 +9,7 @@ name = "bend2-toolchain"
 # <upstream version>+pytarget.<bend2/ source commit>[.<packaging revision>];
 # build.sh checks that the commit here matches the commit it archives. The
 # packaging revision g1 adds guide/, so `bend guide` works.
-version = "2.0.38+pytarget.3983d7c6b.g1"
+version = "2.0.39+pytarget.4823db49b.g1"
 description = "Bend2 compiler with the Python target, bun, and a prebuilt BendTT kernel"
 license = "Apache-2.0"
 requires-python = ">=3.10"
